@@ -1,12 +1,18 @@
 #include "main_window.h"
+#include "backup_file.h"
 #include "chart_widget.h"
+#include "client_provisioner.h"
 #include "editor_dialogs.h"
 #include "three_x_ui_api.h"
 #include <QApplication>
+#include <QCheckBox>
 #include <QClipboard>
 #include <QComboBox>
 #include <QDesktopServices>
+#include <QDialogButtonBox>
 #include <QDir>
+#include <QFileDialog>
+#include <QFileInfo>
 #include <QFrame>
 #include <QHeaderView>
 #include <QInputDialog>
@@ -14,6 +20,7 @@
 #include <QLineEdit>
 #include <QMap>
 #include <QMessageBox>
+#include <QPointer>
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QScrollArea>
@@ -135,6 +142,14 @@ bool confirm(QWidget* parent, const QString& title, const QString& message) {
     box.exec();
     return box.clickedButton() == yes;
 }
+QString backupName(const QString& server, const QString& extension, bool beforeRestore = false) {
+    QString name = server;
+    name.replace(QRegularExpression("[^\\p{L}\\p{N}._-]"), "_");
+    name = name.left(60);
+    return "3x-ui-" + name + (beforeRestore ? "-before-restore-" : "-") +
+           QDateTime::currentDateTimeUtc().toString("yyyyMMdd-HHmmss-zzz") + "-" +
+           QUuid::createUuid().toString(QUuid::Id128).left(6) + extension;
+}
 } // namespace
 
 QString appStyle() {
@@ -194,6 +209,8 @@ MainWindow::MainWindow(QString dataDirectory, bool demo)
     storageReady_ = opened.ok;
     QSettings settings(QDir(dataDirectory_).filePath("settings.ini"), QSettings::IniFormat);
     pollSeconds_ = qBound(10, settings.value("pollSeconds", 30).toInt(), 600);
+    hasMasterPreference_ = settings.contains("masterServerId");
+    masterServerId_ = settings.value("masterServerId").toString();
     buildUi();
     if (storageReady_) {
         const auto configs = store_.servers();
@@ -225,6 +242,8 @@ MainWindow::MainWindow(QString dataDirectory, bool demo)
 }
 MainWindow::~MainWindow() {
     pollTimer_.stop();
+    delete provisioner_;
+    provisioner_ = nullptr;
     qDeleteAll(apis_);
     apis_.clear();
 }
@@ -261,7 +280,7 @@ void MainWindow::buildUi() {
     connect(demoButton_, &QPushButton::clicked, this, [this] { setDemo(!demo_); });
     side->addSpacing(16);
     side->addWidget(label("C++ / Qt  ·  Windows", "muted"));
-    side->addWidget(label("Локальная история · v0.1", "muted"));
+    side->addWidget(label("Локальная история · v0.2", "muted"));
     frame->addWidget(sidebar);
     auto* main = new QWidget;
     auto* layout = new QVBoxLayout(main);
@@ -476,6 +495,17 @@ QWidget* MainWindow::serversPage() {
     connect(update, &QPushButton::clicked, this,
             [this] { runServerAction(ServerAction::InstallXray); });
     l->addLayout(operations);
+    auto* backups = new QHBoxLayout;
+    auto* backup = button("Бэкап 3x-ui");
+    auto* restore = button("Восстановить из бэкапа", "danger");
+    for (auto* b : {backup, restore}) {
+        writeButtons_.append(b);
+        backups->addWidget(b);
+    }
+    backups->addStretch();
+    connect(backup, &QPushButton::clicked, this, &MainWindow::backupServer);
+    connect(restore, &QPushButton::clicked, this, &MainWindow::restoreServer);
+    l->addLayout(backups);
     l->addWidget(
         label("Выберите сервер для действий. Удаление подключения сохраняет клиентов на сервере.",
               "muted"));
@@ -521,8 +551,11 @@ QWidget* MainWindow::clientsPage() {
     connect(toggle, &QPushButton::clicked, this, &MainWindow::toggleClient);
     connect(reset, &QPushButton::clicked, this, &MainWindow::resetClient);
     connect(remove, &QPushButton::clicked, this, &MainWindow::deleteClient);
-    clientTable_ =
-        table({"КЛИЕНТ", "СЕРВЕР", "ПРОТОКОЛ", "СОСТОЯНИЕ", "ТРАФИК / ЛИМИТ", "ДЕЙСТВУЕТ ДО"});
+    masterStatus_ = label("", "muted");
+    masterStatus_->setWordWrap(true);
+    l->addWidget(masterStatus_);
+    clientTable_ = table({"КЛИЕНТ", "СЕРВЕР", "ИНБАУНДЫ", "ПРОТОКОЛ", "СОСТОЯНИЕ", "ТРАФИК / ЛИМИТ",
+                          "ДЕЙСТВУЕТ ДО"});
     clientTable_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
     l->addWidget(clientTable_, 1);
     connect(clientTable_, &QTableWidget::itemDoubleClicked, this, [this] { editClient(false); });
@@ -532,27 +565,7 @@ QWidget* MainWindow::clientsPage() {
     footer->addWidget(clientStatus_, 1);
     auto* copy = button("Копировать ссылку подписки");
     footer->addWidget(copy);
-    connect(copy, &QPushButton::clicked, this, [this] {
-        auto c = selectedClient();
-        if (!c)
-            return;
-        auto it = std::find_if(servers_.begin(), servers_.end(),
-                               [&](const auto& s) { return s.id == c->serverId; });
-        if (it == servers_.end() || it->subscriptionUrl.isEmpty() || c->subId.isEmpty()) {
-            report("Укажите адрес выдачи подписок в настройках сервера. Например: "
-                   "https://vpn.example.com:2096/sub/",
-                   true);
-            return;
-        }
-        QUrl link = it->subscriptionUrl;
-        QString path = link.path(QUrl::FullyEncoded);
-        if (!path.endsWith('/'))
-            path += '/';
-        path += QString::fromLatin1(QUrl::toPercentEncoding(c->subId));
-        link.setPath(path, QUrl::StrictMode);
-        QApplication::clipboard()->setText(link.toString(QUrl::FullyEncoded));
-        report("Ссылка подписки скопирована.");
-    });
+    connect(copy, &QPushButton::clicked, this, &MainWindow::copySubscriptionLink);
     l->addLayout(footer);
     return page;
 }
@@ -596,6 +609,39 @@ QWidget* MainWindow::settingsPage() {
         report("Интервал проверки сохранён.");
     });
     l->addWidget(monitoring);
+    auto* subscription = card();
+    auto* subs = new QVBoxLayout(subscription);
+    subs->setContentsMargins(24, 22, 24, 22);
+    subs->setSpacing(12);
+    subs->addWidget(label("Мастер-нода подписок", "section"));
+    auto* masterHelp = label("Выберите Москву или другой сервер, который уже объединяет ваши "
+                             "подписки в 3x-ui. При копировании общей ссылки приложение использует "
+                             "его адрес выдачи подписок.");
+    masterHelp->setWordWrap(true);
+    subs->addWidget(masterHelp);
+    masterCombo_ = new QComboBox;
+    masterCombo_->setObjectName("masterServer");
+    masterCombo_->addItem("Без мастер-ноды — ссылка выбранного сервера", "");
+    subs->addWidget(masterCombo_);
+    auto* topology = label("Выбор мастер-ноды здесь не меняет связи между серверами в 3x-ui. "
+                           "Для общей ссылки клиент должен быть создан и на мастер-ноде.",
+                           "muted");
+    topology->setWordWrap(true);
+    subs->addWidget(topology);
+    connect(masterCombo_, &QComboBox::currentIndexChanged, this, [this] {
+        if (demo_)
+            return;
+        masterServerId_ = masterCombo_->currentData().toString();
+        hasMasterPreference_ = true;
+        QSettings settings(QDir(dataDirectory_).filePath("settings.ini"), QSettings::IniFormat);
+        settings.setValue("masterServerId", masterServerId_);
+        settings.sync();
+        refreshMasterSelector();
+        report(settings.status() == QSettings::NoError ? "Мастер-нода сохранена."
+                                                       : "Не удалось сохранить мастер-ноду.",
+               settings.status() != QSettings::NoError);
+    });
+    l->addWidget(subscription);
     auto* storage = card();
     auto* sl = new QVBoxLayout(storage);
     sl->setContentsMargins(24, 22, 24, 22);
@@ -651,6 +697,82 @@ QString MainWindow::serverName(const QString& id) const {
             return s.name;
     return "Удалённый сервер";
 }
+QString MainWindow::activeMasterServerId() const {
+    return demo_ ? "demo-0" : masterServerId_;
+}
+void MainWindow::refreshMasterSelector() {
+    if (!demo_ && !hasMasterPreference_) {
+        QStringList matches;
+        for (const auto& server : servers_) {
+            const QString text = server.name + " " + server.location;
+            if (text.contains("Москва", Qt::CaseInsensitive) ||
+                text.contains("Moscow", Qt::CaseInsensitive))
+                matches.append(server.id);
+        }
+        if (matches.size() == 1) {
+            masterServerId_ = matches.first();
+            hasMasterPreference_ = true;
+            QSettings settings(QDir(dataDirectory_).filePath("settings.ini"), QSettings::IniFormat);
+            settings.setValue("masterServerId", masterServerId_);
+        }
+    }
+    const QString id = activeMasterServerId();
+    masterCombo_->blockSignals(true);
+    masterCombo_->clear();
+    masterCombo_->addItem("Без мастер-ноды — ссылка выбранного сервера", "");
+    for (const auto& server : servers_)
+        masterCombo_->addItem(server.name, server.id);
+    masterCombo_->setCurrentIndex(qMax(0, masterCombo_->findData(id)));
+    masterCombo_->blockSignals(false);
+    masterStatus_->setText(id.isEmpty()
+                               ? "Создание доступно на нескольких серверах. Мастер-ноду для общей "
+                                 "ссылки выберите в Настройках."
+                               : "Мастер-нода: " + serverName(id) +
+                                     " · общая ссылка использует её адрес выдачи подписок.");
+}
+void MainWindow::copySubscriptionLink() {
+    auto client = selectedClient();
+    if (!client)
+        return;
+    const QString master = activeMasterServerId();
+    const QString id = master.isEmpty() ? client->serverId : master;
+    if (!master.isEmpty() && client->serverId != master) {
+        if (!inventories_.contains(master)) {
+            report("Сначала загрузите клиентов мастер-ноды, чтобы проверить общую подписку.", true);
+            return;
+        }
+        bool matched = false;
+        for (const auto& candidate : inventories_.value(master).clients)
+            if (candidate.email == client->email && !candidate.subId.isEmpty() &&
+                candidate.subId == client->subId) {
+                matched = true;
+                break;
+            }
+        if (!matched) {
+            report("На мастер-ноде нет клиента с этим именем и subId. "
+                   "При создании общей подписки выберите также её инбаунды.",
+                   true);
+            return;
+        }
+    }
+    const auto server =
+        std::find_if(servers_.cbegin(), servers_.cend(), [&](const auto& s) { return s.id == id; });
+    if (server == servers_.cend() || server->subscriptionUrl.isEmpty() || client->subId.isEmpty()) {
+        report("Укажите адрес выдачи подписок в настройках " +
+                   QString(master.isEmpty() ? "выбранного сервера" : "мастер-ноды") +
+                   ". Например: https://vpn.example.com:2096/sub/",
+               true);
+        return;
+    }
+    QUrl link = server->subscriptionUrl;
+    QString path = link.path(QUrl::FullyEncoded);
+    if (!path.endsWith('/'))
+        path += '/';
+    path += QString::fromLatin1(QUrl::toPercentEncoding(client->subId));
+    link.setPath(path, QUrl::StrictMode);
+    QApplication::clipboard()->setText(link.toString(QUrl::FullyEncoded));
+    report("Ссылка подписки скопирована: " + server->name + ".");
+}
 void MainWindow::report(const QString& text, bool error) {
     notice_->setText(text);
     notice_->setStyleSheet(error ? "color:#ef8d9d;" : "color:#8b99ac;");
@@ -677,6 +799,7 @@ void MainWindow::setBusyUi() {
         b->setEnabled(storageReady_ && !demo_ && !mutating_ && !inventoryPending_ &&
                       (!polling_ || b->property("allowPolling").toBool()));
     demoButton_->setEnabled(!polling_ && !mutating_ && !inventoryPending_);
+    masterCombo_->setEnabled(storageReady_ && !demo_ && !mutating_);
 }
 void MainWindow::reloadData() {
     if (demo_ || !storageReady_)
@@ -773,6 +896,7 @@ void MainWindow::refreshUi() {
     int idx = serverFilter_->findData(oldFilter);
     serverFilter_->setCurrentIndex(qMax(0, idx));
     serverFilter_->blockSignals(false);
+    refreshMasterSelector();
     refreshServersTable();
     refreshClientsTable();
     refreshEventsTable();
@@ -848,10 +972,34 @@ void MainWindow::refreshClientsTable() {
             visibleClients_.append(c);
             cell(clientTable_, row, 0, c.email);
             cell(clientTable_, row, 1, s.name);
-            cell(clientTable_, row, 2, c.protocol.toUpper());
+            QStringList bindings;
+            QStringList protocols;
+            for (int inboundId : c.inboundIds) {
+                QString description = "#" + QString::number(inboundId);
+                for (const auto& inbound : inventories_.value(s.id).inbounds)
+                    if (inbound.id == inboundId) {
+                        description +=
+                            " · " + inbound.remark + " · " + QString::number(inbound.port);
+                        const QString protocol = inbound.protocol.toUpper();
+                        if (!protocols.contains(protocol))
+                            protocols.append(protocol);
+                        break;
+                    }
+                bindings.append(description);
+            }
+            cell(clientTable_, row, 2,
+                 c.inboundIds.isEmpty() ? "Нет привязок" : QString::number(c.inboundIds.size()),
+                 QColor("#93a4bb"), bindings.join('\n'));
+            protocols.sort();
+            cell(clientTable_, row, 3,
+                 protocols.isEmpty() ? (c.protocol.isEmpty() ? "—" : c.protocol.toUpper())
+                                     : protocols.join(" / "));
             QString state = "Активна";
             QColor color("#46d8a9");
-            if (!c.enable) {
+            if (c.inboundIds.isEmpty()) {
+                state = "Нет инбаундов";
+                color = QColor("#e6b950");
+            } else if (!c.enable) {
                 state = "Отключена";
                 color = QColor("#8b99ac");
             } else if (c.expiryTime > 0 && c.expiryTime < QDateTime::currentMSecsSinceEpoch()) {
@@ -862,11 +1010,11 @@ void MainWindow::refreshClientsTable() {
                 color = QColor("#e6b950");
             } else if (c.online && *c.online)
                 state = "Онлайн";
-            cell(clientTable_, row, 3, state, color);
-            cell(clientTable_, row, 4,
+            cell(clientTable_, row, 4, state, color);
+            cell(clientTable_, row, 5,
                  bytes(double(c.usedBytes)) + " / " +
                      (c.totalBytes ? bytes(double(c.totalBytes)) : "∞"));
-            cell(clientTable_, row, 5,
+            cell(clientTable_, row, 6,
                  c.expiryTime == 0 ? "Без срока"
                  : c.expiryTime < 0
                      ? "После первого входа"
@@ -1178,6 +1326,7 @@ void MainWindow::editServer() {
     apis_[id] = new ThreeXUiApi(config, this);
     inventories_.remove(id);
     recordEvent(id, "Подключение изменено", true, "Настройки обновлены");
+    refreshUi();
     poll();
     fetchInventories();
 }
@@ -1206,6 +1355,12 @@ void MainWindow::removeServer() {
     inventories_.remove(id);
     inventoryErrors_.remove(id);
     latest_.remove(id);
+    if (masterServerId_ == id) {
+        masterServerId_.clear();
+        hasMasterPreference_ = true;
+        QSettings settings(QDir(dataDirectory_).filePath("settings.ini"), QSettings::IniFormat);
+        settings.setValue("masterServerId", "");
+    }
     reloadData();
     refreshUi();
 }
@@ -1223,7 +1378,7 @@ void MainWindow::editClient(bool create) {
         fetchInventories();
         return;
     }
-    ClientDialog dialog(servers_, inventories_, existing, this);
+    ClientDialog dialog(servers_, inventories_, existing, this, activeMasterServerId());
     if (dialog.exec() != QDialog::Accepted)
         return;
     if (!create) {
@@ -1233,20 +1388,65 @@ void MainWindow::editClient(bool create) {
             return;
         }
     }
-    const QString id = dialog.selectedServerId();
-    auto* api = apis_.value(id);
-    if (!api)
-        return;
-    mutating_ = true;
-    setBusyUi();
-    if (create)
-        api->createClient(dialog.draft(), [this, id](OperationResult r) {
-            completeMutation(id, "Создание подписки", r);
-        });
-    else
+    if (create) {
+        mutating_ = true;
+        setBusyUi();
+        provisioner_ = new ClientProvisioner(apis_, this);
+        report("Проверка выбранных серверов перед созданием подписки…");
+        provisioner_->provision(
+            dialog.targets(), dialog.draft(), activeMasterServerId(),
+            [this](Outcome<ProvisionSummary> result) {
+                provisioner_->deleteLater();
+                provisioner_ = nullptr;
+                mutating_ = false;
+                QString message;
+                bool failed = !result.ok;
+                if (!result.ok) {
+                    message = result.error;
+                    recordEvent({}, "Создание подписки", false, message);
+                } else {
+                    int completed = 0;
+                    QStringList details;
+                    for (const auto& node : result.value.nodes) {
+                        if (node.ok)
+                            ++completed;
+                        else
+                            failed = true;
+                        const QString detail = node.ok ? QString::number(node.inboundIds.size()) +
+                                                             " инбаундов: подтверждено сервером"
+                                                       : node.error;
+                        recordEvent(node.serverId, "Создание подписки", node.ok, detail);
+                        details.append(serverName(node.serverId) + ": " + detail);
+                    }
+                    message = "Создано на " + QString::number(completed) + " из " +
+                              QString::number(result.value.nodes.size()) + " серверов.";
+                    if (failed)
+                        message += "\n\n" + details.join('\n') +
+                                   "\n\nОбновите список перед повторением: после сетевого сбоя "
+                                   "результат на сервере может быть неизвестен.";
+                }
+                setBusyUi();
+                if (failed) {
+                    QMessageBox box(QMessageBox::Warning, "Результат создания подписки", message,
+                                    QMessageBox::Ok, this);
+                    box.setTextFormat(Qt::PlainText);
+                    box.exec();
+                }
+                report(message.section('\n', 0, 0), failed);
+                loadInventories();
+                poll();
+            });
+    } else {
+        const QString id = dialog.selectedServerId();
+        auto* api = apis_.value(id);
+        if (!api)
+            return;
+        mutating_ = true;
+        setBusyUi();
         api->updateClient(*existing, dialog.patch(), [this, id](OperationResult r) {
             completeMutation(id, "Изменение подписки", r);
         });
+    }
 }
 void MainWindow::toggleClient() {
     if (!writable(true))
@@ -1336,6 +1536,211 @@ void MainWindow::resetClient() {
     setBusyUi();
     api->resetClientTraffic(*client, [this, id = client->serverId](OperationResult r) {
         completeMutation(id, "Сброс трафика", r);
+    });
+}
+void MainWindow::backupServer() {
+    if (!writable())
+        return;
+    const auto* server = selectedServer();
+    if (!server)
+        return;
+    const QString id = server->id, name = server->name;
+    auto* api = apis_.value(id);
+    if (!api)
+        return;
+    mutating_ = true;
+    setBusyUi();
+    report("Загрузка полной базы 3x-ui: " + name + "…");
+    api->downloadDatabase([this, id, name](Outcome<QByteArray> downloaded) {
+        if (!downloaded.ok) {
+            completeMutation(id, "Бэкап 3x-ui", OperationResult::failure(downloaded.error));
+            return;
+        }
+        const auto info = inspectDatabaseBackup(downloaded.value);
+        if (!info.ok) {
+            completeMutation(id, "Бэкап 3x-ui", OperationResult::failure(info.error));
+            return;
+        }
+        const QString path = QFileDialog::getSaveFileName(
+            this, "Сохранить базу 3x-ui — файл содержит настройки и ключи клиентов",
+            QDir(dataDirectory_).filePath(backupName(name, info.value.extension())),
+            info.value.kind == BackupKind::SQLite ? "База 3x-ui (*.db);;Все файлы (*)"
+                                                  : "Дамп PostgreSQL (*.dump);;Все файлы (*)");
+        if (path.isEmpty()) {
+            mutating_ = false;
+            setBusyUi();
+            report("Сохранение бэкапа отменено.");
+            return;
+        }
+        const auto saved = saveDatabaseBackup(path, downloaded.value);
+        mutating_ = false;
+        setBusyUi();
+        recordEvent(id, "Бэкап 3x-ui", saved.ok,
+                    saved.ok ? "Полная база сохранена: " + path : saved.error);
+        report(saved.ok ? "База 3x-ui сохранена: " + path : saved.error, !saved.ok);
+    });
+}
+void MainWindow::restoreServer() {
+    if (!writable())
+        return;
+    const auto* server = selectedServer();
+    if (!server)
+        return;
+    const QString id = server->id, name = server->name;
+    const QString path =
+        QFileDialog::getOpenFileName(this, "Выбрать бэкап базы 3x-ui", dataDirectory_,
+                                     "Бэкапы 3x-ui (*.db *.dump);;Все файлы (*)");
+    if (path.isEmpty())
+        return;
+    auto backupContents = readDatabaseBackup(path);
+    if (!backupContents.ok) {
+        report(backupContents.error, true);
+        return;
+    }
+    const auto info = inspectDatabaseBackup(backupContents.value);
+    if (!info.ok) {
+        report(info.error, true);
+        return;
+    }
+    QDialog dialog(this);
+    dialog.setWindowTitle("Восстановить базу 3x-ui");
+    dialog.setMinimumWidth(570);
+    auto* layout = new QVBoxLayout(&dialog);
+    layout->setContentsMargins(24, 24, 24, 24);
+    layout->setSpacing(16);
+    auto* description = label("Сервер: " + name + "\nБэкап: " + QFileInfo(path).fileName() +
+                              "\nРазмер: " + bytes(double(info.value.size)));
+    description->setWordWrap(true);
+    layout->addWidget(description);
+    if (info.value.kind == BackupKind::SQLite)
+        layout->addWidget(
+            label("Инбаундов: " + QString::number(info.value.inboundCount) + " · клиентов: " +
+                      (info.value.clientCount < 0 ? QString("старый формат в инбаундах")
+                                                  : QString::number(info.value.clientCount)),
+                  "muted"));
+    else {
+        auto* pg = label("Проверен заголовок дампа PostgreSQL. Полную проверку выполняет "
+                         "целевая 3x-ui при импорте.",
+                         "muted");
+        pg->setWordWrap(true);
+        layout->addWidget(pg);
+    }
+    auto* keep = new QCheckBox("Сохранить адреса, сертификаты и идентификатор целевого сервера");
+    keep->setChecked(true);
+    layout->addWidget(keep);
+    auto* effect = label("Клиенты, инбаунды и остальные настройки базы будут заменены. "
+                         "Если снять галочку, адрес и порт панели тоже могут измениться. "
+                         "Внешние файлы сертификатов и Geo-файлы нужно переносить отдельно.");
+    effect->setWordWrap(true);
+    layout->addWidget(effect);
+    auto* rollback = label("Перед заменой приложение сохранит текущую базу целевого сервера "
+                           "в папку backups рядом с локальными данными. Если это не удастся, "
+                           "восстановление не начнётся.",
+                           "muted");
+    rollback->setWordWrap(true);
+    layout->addWidget(rollback);
+    auto* actions = new QDialogButtonBox;
+    auto* restore = actions->addButton("Заменить базу", QDialogButtonBox::AcceptRole);
+    restore->setProperty("role", "danger");
+    restore->setAutoDefault(false);
+    auto* cancel = actions->addButton("Отмена", QDialogButtonBox::RejectRole);
+    cancel->setDefault(true);
+    connect(actions, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(actions, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    layout->addWidget(actions);
+    if (dialog.exec() != QDialog::Accepted)
+        return;
+    const bool keepHostSettings = keep->isChecked();
+    if (!writable())
+        return;
+    const QString rollbackDirectory = QDir(dataDirectory_).filePath("backups");
+    if (!QDir().mkpath(rollbackDirectory)) {
+        report("Не удалось создать папку для копии текущей базы. Восстановление отменено.", true);
+        return;
+    }
+    QPointer<ThreeXUiApi> api = apis_.value(id);
+    if (!api)
+        return;
+    mutating_ = true;
+    setBusyUi();
+    report("Сохранение текущей базы «" + name + "» перед заменой…");
+    api->downloadDatabase([this, id, name, api, rollbackDirectory, keepHostSettings,
+                           restoreData =
+                               std::move(backupContents.value)](Outcome<QByteArray> before) {
+        if (!before.ok) {
+            completeMutation(
+                id, "Восстановление 3x-ui",
+                OperationResult::failure(
+                    "Не удалось получить текущую базу. Восстановление отменено. " + before.error));
+            return;
+        }
+        const auto beforeInfo = inspectDatabaseBackup(before.value);
+        if (!beforeInfo.ok) {
+            completeMutation(
+                id, "Восстановление 3x-ui",
+                OperationResult::failure(
+                    "Копия текущей базы не прошла проверку. Восстановление отменено. " +
+                    beforeInfo.error));
+            return;
+        }
+        const QString rollbackPath =
+            QDir(rollbackDirectory).filePath(backupName(name, beforeInfo.value.extension(), true));
+        const auto saved = saveDatabaseBackup(rollbackPath, before.value);
+        if (!saved.ok) {
+            completeMutation(
+                id, "Восстановление 3x-ui",
+                OperationResult::failure(
+                    "Не удалось сохранить текущую базу. Восстановление отменено. " + saved.error));
+            return;
+        }
+        recordEvent(id, "Бэкап перед восстановлением", true, "База сохранена: " + rollbackPath);
+        if (!api) {
+            completeMutation(
+                id, "Восстановление 3x-ui",
+                OperationResult::failure(
+                    "Подключение закрыто. Текущая база сохранена, импорт не запущен."));
+            return;
+        }
+        report("Восстановление базы 3x-ui на «" + name + "»…");
+        api->restoreDatabase(
+            restoreData, keepHostSettings,
+            [this, id, keepHostSettings, rollbackPath](OperationResult result) {
+                // Recreate the session after the API operation has unwound.
+                QTimer::singleShot(0, this, [this, id, keepHostSettings, rollbackPath, result] {
+                    if (!result.ok) {
+                        completeMutation(
+                            id, "Восстановление 3x-ui",
+                            OperationResult::failure(result.error +
+                                                     "\nКопия базы до импорта: " + rollbackPath));
+                        return;
+                    }
+                    delete apis_.take(id);
+                    for (const auto& config : servers_)
+                        if (config.id == id)
+                            apis_.insert(id, new ThreeXUiApi(config, this));
+                    inventories_.remove(id);
+                    inventoryErrors_.remove(id);
+                    latest_.remove(id);
+                    mutating_ = false;
+                    recordEvent(id, "Восстановление 3x-ui", true,
+                                "Импорт подтверждён. Копия предыдущей базы: " + rollbackPath);
+                    refreshUi();
+                    QMessageBox box(
+                        QMessageBox::Information, "База восстановлена",
+                        "Сервер подтвердил импорт.\n\nКопия базы до импорта:\n" + rollbackPath +
+                            (keepHostSettings
+                                 ? "\n\nПароль или токен панели могли измениться. При ошибке входа "
+                                   "обновите подключение в разделе Серверы."
+                                 : "\n\nАдрес, порт и доступы панели могли измениться. "
+                                   "Обновите подключение в разделе Серверы."),
+                        QMessageBox::Ok, this);
+                    box.setTextFormat(Qt::PlainText);
+                    box.exec();
+                    report("База восстановлена. Копия до импорта: " + rollbackPath);
+                    loadInventories(id);
+                    poll();
+                });
+            });
     });
 }
 void MainWindow::runServerAction(ServerAction action) {
@@ -1436,10 +1841,9 @@ void MainWindow::generateDemo() {
     history_.clear();
     events_.clear();
     const QDateTime now = QDateTime::currentDateTimeUtc();
-    const QStringList names = {"Frankfurt · DE-01", "Amsterdam · NL-01", "Helsinki · FI-01",
-                               "Warsaw · PL-01",    "Paris · FR-01",     "Stockholm · SE-01"};
-    const QStringList places = {"Германия", "Нидерланды", "Финляндия",
-                                "Польша",   "Франция",    "Швеция"};
+    const QStringList names = {"Москва · мастер-нода", "Amsterdam · NL-01", "Helsinki · FI-01",
+                               "Warsaw · PL-01",       "Paris · FR-01",     "Stockholm · SE-01"};
+    const QStringList places = {"Россия", "Нидерланды", "Финляндия", "Польша", "Франция", "Швеция"};
     for (int n = 0; n < names.size(); ++n) {
         ServerConfig s;
         s.id = "demo-" + QString::number(n);
@@ -1450,12 +1854,13 @@ void MainWindow::generateDemo() {
         servers_.append(s);
         Inventory inv;
         inv.inbounds.append({s.id, 1, "VLESS Reality", "vless", 443, true});
+        inv.inbounds.append({s.id, 2, "VLESS WebSocket", "vless", 8443, true});
         for (int c = 0; c < 5; ++c) {
             Client client;
             client.serverId = s.id;
-            client.inboundIds = {1};
+            client.inboundIds = {1, 2};
             client.id = "example-" + QString::number(c);
-            client.email = "client-" + QString::number(n * 5 + c + 1);
+            client.email = "client-" + QString::number(c + 1);
             client.subId = "demo-sub-" + QString::number(c);
             client.protocol = "vless";
             client.enable = c != 4;

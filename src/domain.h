@@ -86,12 +86,30 @@ struct Inventory {
     QList<Client> clients;
 };
 struct ClientDraft {
-    int inboundId = 0;
+    QList<int> inboundIds;
     QString email;
     qint64 totalBytes = 0;
     qint64 expiryTime = 0;
     bool enable = true;
     QString flow;
+    QString clientId;
+    QString password;
+    QString subId;
+};
+struct ClientTarget {
+    QString serverId;
+    QList<int> inboundIds;
+};
+struct ProvisionNodeResult {
+    QString serverId;
+    QList<int> inboundIds;
+    bool ok = false;
+    QString error;
+};
+struct ProvisionSummary {
+    QList<ProvisionNodeResult> nodes;
+    QString clientId;
+    QString subId;
 };
 struct ClientPatch {
     std::optional<qint64> totalBytes;

@@ -1,6 +1,7 @@
-param([string]$QtRoot = '', [switch]$TestsOnly, [switch]$Package)
+param([string]$QtRoot = '', [switch]$TestsOnly, [switch]$Package, [string]$DistName = '3X-Control-0.2')
 $ErrorActionPreference = 'Stop'
 $taskRoot = Split-Path -Parent $PSScriptRoot
+if ($DistName -notmatch '^3X-Control(?:-[0-9][0-9a-zA-Z.-]*)?$') { throw 'DistName должен быть именем папки 3X-Control или 3X-Control-<версия>.' }
 function Invoke-BuildTool([string]$Executable, [string[]]$ToolArguments) {
     # Windows build tools reject duplicated case variants of inherited env keys.
     $toolEnvironment = [System.Collections.Generic.Dictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -38,11 +39,11 @@ if (-not (Test-Path -LiteralPath $cmakeExe)) { throw 'CMake не найден.' 
 $ctestExe = Join-Path (Split-Path -Parent $cmakeExe) 'ctest.exe'
 $buildRoot = Join-Path $taskRoot 'build'
 Invoke-BuildTool $cmakeExe @('-S',$taskRoot,'-B',$buildRoot,"-DCMAKE_PREFIX_PATH=$QtRoot",'-DBUILD_TESTING=ON')
-if ($TestsOnly) { Invoke-BuildTool $cmakeExe @('--build',$buildRoot,'--config','Release','--target','fleet_core_tests','fleet_storage_tests','fleet_dialog_tests','--parallel','4') } else { Invoke-BuildTool $cmakeExe @('--build',$buildRoot,'--config','Release','--parallel','4') }
+if ($TestsOnly) { Invoke-BuildTool $cmakeExe @('--build',$buildRoot,'--config','Release','--target','fleet_core_tests','fleet_storage_tests','fleet_dialog_tests','fleet_provision_tests','fleet_backup_tests','--parallel','4') } else { Invoke-BuildTool $cmakeExe @('--build',$buildRoot,'--config','Release','--parallel','4') }
 $env:PATH = (Join-Path $QtRoot 'bin') + ';' + $env:PATH
 Invoke-BuildTool $ctestExe @('--test-dir',$buildRoot,'-C','Release','--output-on-failure')
 if ($Package) {
-    $distRoot = Join-Path $taskRoot 'dist\3X-Control'
+    $distRoot = Join-Path (Join-Path $taskRoot 'dist') $DistName
     New-Item -ItemType Directory -Path $distRoot -Force | Out-Null
     Copy-Item -LiteralPath (Join-Path $buildRoot 'Release\3X-Control.exe') -Destination $distRoot
     Invoke-BuildTool (Join-Path $QtRoot 'bin\windeployqt.exe') @('--release','--no-translations','--no-opengl-sw','--no-compiler-runtime','--skip-plugin-types','generic','--include-plugins','qsqlite',(Join-Path $distRoot '3X-Control.exe'))

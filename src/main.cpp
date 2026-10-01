@@ -14,7 +14,7 @@ int main(int argc, char** argv) {
     QApplication app(argc, argv);
     app.setApplicationName("3X Control");
     app.setOrganizationName("3XControl");
-    app.setApplicationVersion("0.1.0");
+    app.setApplicationVersion("0.2.0");
     app.setStyle("Fusion");
     app.setFont(QFont("Segoe UI", 10));
     QPalette palette;
@@ -77,14 +77,23 @@ int main(int argc, char** argv) {
         if (parser.value("capture-dialog") == "server")
             captureDialog = std::make_unique<fleet::ServerDialog>(std::nullopt, &window);
         else if (parser.value("capture-dialog") == "client") {
-            fleet::ServerConfig server;
-            server.id = "preview";
-            server.name = "Frankfurt · DE-01";
-            fleet::Inventory inventory;
-            inventory.inbounds.append({server.id, 1, "VLESS Reality", "vless", 443, true});
+            QList<fleet::ServerConfig> servers;
+            QHash<QString, fleet::Inventory> inventories;
+            const QStringList names = {"Москва · мастер-нода", "Нидерланды", "Германия"};
+            for (int n = 0; n < names.size(); ++n) {
+                fleet::ServerConfig server;
+                server.id = "preview-" + QString::number(n);
+                server.name = names[n];
+                fleet::Inventory inventory;
+                inventory.inbounds.append({server.id, 1, "VLESS Reality", "vless", 443, true});
+                inventory.inbounds.append({server.id, 2, "VLESS WebSocket", "vless", 8443, true});
+                if (n == 1)
+                    inventory.inbounds.append({server.id, 3, "Trojan TLS", "trojan", 9443, true});
+                servers.append(server);
+                inventories.insert(server.id, inventory);
+            }
             captureDialog = std::make_unique<fleet::ClientDialog>(
-                QList<fleet::ServerConfig>{server},
-                QHash<QString, fleet::Inventory>{{server.id, inventory}}, std::nullopt, &window);
+                servers, inventories, std::nullopt, &window, "preview-0");
         } else
             return 2;
         captureDialog->show();

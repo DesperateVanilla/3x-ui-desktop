@@ -1,6 +1,8 @@
 #include "three_x_ui_api.h"
+#include "backup_file.h"
 
 #include <QElapsedTimer>
+#include <QIODevice>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QNetworkReply>
@@ -14,6 +16,7 @@
 #include <QUuid>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <memory>
 
@@ -21,6 +24,36 @@ namespace fleet {
 namespace {
 constexpr qint64 kResponseLimit = 16 * 1024 * 1024;
 constexpr int kRequestTimeoutMs = 8000;
+
+// Qt can rewind a buffered POST and resend it after a dropped connection.
+// A mutation body must be readable once, including by Qt's HTTP transport.
+class OneShotUpload final : public QIODevice {
+  public:
+    explicit OneShotUpload(QByteArray bytes) : bytes_(std::move(bytes)) {
+        open(QIODevice::ReadOnly | QIODevice::Unbuffered);
+    }
+    bool isSequential() const override { return true; }
+    bool reset() override { return false; }
+    qint64 size() const override { return bytes_.size(); }
+    qint64 bytesAvailable() const override {
+        return bytes_.size() - consumed_ + QIODevice::bytesAvailable();
+    }
+
+  protected:
+    qint64 readData(char* output, qint64 maximum) override {
+        const qint64 count = std::min(maximum, static_cast<qint64>(bytes_.size()) - consumed_);
+        if (count > 0) {
+            std::memcpy(output, bytes_.constData() + consumed_, static_cast<size_t>(count));
+            consumed_ += count;
+        }
+        return count;
+    }
+    qint64 writeData(const char*, qint64) override { return -1; }
+
+  private:
+    QByteArray bytes_;
+    qint64 consumed_ = 0;
+};
 
 std::optional<double> nonnegativeNumber(const QJsonValue& value) {
     if (!value.isDouble())
@@ -85,18 +118,22 @@ QString identifier(const QJsonObject& raw, const QString& protocol = {}) {
     return raw.value(QStringLiteral("password")).toString();
 }
 
-QList<int> inboundIds(const QJsonValue& value) {
+Outcome<QList<int>> inboundIds(const QJsonValue& value) {
     QList<int> ids;
+    if (value.isUndefined() || value.isNull())
+        return Outcome<QList<int>>::success(ids);
     if (!value.isArray())
-        return ids;
+        return Outcome<QList<int>>::failure(
+            QStringLiteral("Панель вернула некорректные привязки клиента."));
     for (const auto& entry : value.toArray()) {
         const auto id = integer(entry);
         if (!id || *id <= 0 || *id > std::numeric_limits<int>::max())
-            return {};
+            return Outcome<QList<int>>::failure(
+                QStringLiteral("Панель вернула некорректные привязки клиента."));
         if (!ids.contains(static_cast<int>(*id)))
             ids.append(static_cast<int>(*id));
     }
-    return ids;
+    return Outcome<QList<int>>::success(ids);
 }
 
 bool sameInboundIds(QList<int> left, QList<int> right) {
@@ -106,12 +143,12 @@ bool sameInboundIds(QList<int> left, QList<int> right) {
 }
 
 bool sameIdentity(const Client& selected, const QJsonObject& fresh, const QList<int>& ids) {
-    if (selected.id.isEmpty() || selected.email.isEmpty() || selected.inboundIds.isEmpty() ||
+    if (selected.id.isEmpty() || selected.email.isEmpty() ||
         fresh.value(QStringLiteral("email")).toString() != selected.email ||
         identifier(fresh, selected.protocol) != selected.id ||
         !sameInboundIds(selected.inboundIds, ids))
         return false;
-    for (const auto* key : {"uuid", "password"}) {
+    for (const auto* key : {"uuid", "password", "subId"}) {
         const QString field = QString::fromLatin1(key);
         if (selected.raw.contains(field) && selected.raw.value(field) != fresh.value(field))
             return false;
@@ -146,7 +183,8 @@ bool validEmail(const QString& email) {
     if (email.isEmpty() || email.size() > 128 || email != email.trimmed())
         return false;
     for (const QChar character : email) {
-        if (character.category() == QChar::Other_Control || character == QLatin1Char('/') ||
+        if (character.category() == QChar::Other_Control || character.isSpace() ||
+            character == QLatin1Char('\\') || character == QLatin1Char('/') ||
             character == QLatin1Char('?') || character == QLatin1Char('#'))
             return false;
     }
@@ -202,6 +240,89 @@ Outcome<QJsonObject> modernModel(QJsonObject record, const QString& protocol) {
             QStringLiteral("Панель вернула некорректные reverse настройки клиента."));
     }
     return Outcome<QJsonObject>::success(record);
+}
+
+QJsonArray jsonIds(const QList<int>& ids) {
+    QJsonArray array;
+    for (int id : ids)
+        array.append(id);
+    return array;
+}
+
+Outcome<QList<Inbound>> selectedInbounds(const QJsonArray& data, const ClientDraft& draft,
+                                         const QString& serverId) {
+    const auto parsed = ThreeXUiApi::parseInventory(data, {}, serverId, true);
+    if (!parsed.ok)
+        return Outcome<QList<Inbound>>::failure(parsed.error);
+    QList<Inbound> selected;
+    for (int id : draft.inboundIds) {
+        auto found = std::find_if(parsed.value.inbounds.cbegin(), parsed.value.inbounds.cend(),
+                                  [id](const Inbound& inbound) { return inbound.id == id; });
+        if (found == parsed.value.inbounds.cend() || !found->enable)
+            return Outcome<QList<Inbound>>::failure(
+                QStringLiteral("Inbound удалён или отключён. Обновите список."));
+        if (found->protocol != QStringLiteral("vless") &&
+            found->protocol != QStringLiteral("vmess") &&
+            found->protocol != QStringLiteral("trojan"))
+            return Outcome<QList<Inbound>>::failure(
+                QStringLiteral("Создание клиента для этого протокола пока не поддерживается."));
+        if (!draft.flow.isEmpty() && found->protocol != QStringLiteral("vless"))
+            return Outcome<QList<Inbound>>::failure(
+                QStringLiteral("Flow xtls-rprx-vision доступен только при выборе VLESS inbound."));
+        selected.append(*found);
+    }
+    return Outcome<QList<Inbound>>::success(selected);
+}
+
+bool matchesDraft(const QJsonObject& raw, const ClientDraft& draft, bool checkEnable = true,
+                  const QString& legacyProtocol = {}, bool vmess = false) {
+    const QString access = legacyProtocol == QStringLiteral("trojan")
+                               ? raw.value(QStringLiteral("password")).toString()
+                               : identifier(raw);
+    const QString expected =
+        legacyProtocol == QStringLiteral("trojan") ? draft.password : draft.clientId;
+    const auto quota = integer(raw.value(QStringLiteral("totalGB")));
+    const auto expiry = integer(raw.value(QStringLiteral("expiryTime")), true);
+    return raw.value(QStringLiteral("email")).toString() == draft.email && access == expected &&
+           raw.value(QStringLiteral("password")).toString() == draft.password &&
+           raw.value(QStringLiteral("subId")).toString() == draft.subId && quota &&
+           *quota == draft.totalBytes && expiry && *expiry == draft.expiryTime &&
+           raw.value(QStringLiteral("enable")).isBool() &&
+           (!checkEnable || raw.value(QStringLiteral("enable")).toBool() == draft.enable) &&
+           raw.value(QStringLiteral("flow")).toString() == draft.flow &&
+           (!vmess || raw.value(QStringLiteral("security")).toString() == QStringLiteral("auto"));
+}
+
+QJsonObject newClient(const ClientDraft& draft, const QList<Inbound>& inbounds, bool modern) {
+    bool vmess = false;
+    bool trojan = false;
+    for (const auto& inbound : inbounds) {
+        vmess |= inbound.protocol == QStringLiteral("vmess");
+        trojan |= inbound.protocol == QStringLiteral("trojan");
+    }
+    QJsonObject client{{QStringLiteral("email"), draft.email},
+                       {QStringLiteral("totalGB"), draft.totalBytes},
+                       {QStringLiteral("expiryTime"), draft.expiryTime},
+                       {QStringLiteral("enable"), draft.enable},
+                       {QStringLiteral("subId"), draft.subId},
+                       {QStringLiteral("flow"), draft.flow},
+                       {QStringLiteral("limitIp"), 0},
+                       {QStringLiteral("limitHwid"), 0},
+                       {QStringLiteral("tgId"), 0},
+                       {QStringLiteral("comment"), QString()},
+                       {QStringLiteral("reset"), 0}};
+    if (modern || !trojan)
+        client.insert(QStringLiteral("id"), draft.clientId);
+    if (!draft.password.isEmpty())
+        client.insert(QStringLiteral("password"), draft.password);
+    if (vmess)
+        client.insert(QStringLiteral("security"), QStringLiteral("auto"));
+    return client;
+}
+
+QString collisionError() {
+    return QStringLiteral("Email или идентификатор уже принадлежит другому клиенту. Обновите "
+                          "список; чужая запись не изменена.");
 }
 } // namespace
 
@@ -356,11 +477,10 @@ Outcome<Inventory> ThreeXUiApi::parseInventory(const QJsonArray& inbounds,
             Client client;
             client.serverId = serverId;
             client.raw = value.toObject();
-            client.inboundIds = inboundIds(client.raw.value(QStringLiteral("inboundIds")));
-            if (client.raw.contains(QStringLiteral("inboundIds")) &&
-                !client.raw.value(QStringLiteral("inboundIds")).isArray())
-                return Outcome<Inventory>::failure(
-                    QStringLiteral("Панель вернула некорректные привязки клиента."));
+            const auto bindings = inboundIds(client.raw.value(QStringLiteral("inboundIds")));
+            if (!bindings.ok)
+                return Outcome<Inventory>::failure(bindings.error);
+            client.inboundIds = bindings.value;
             for (const int id : client.inboundIds) {
                 if (client.protocol.isEmpty())
                     client.protocol = protocols.value(id);
@@ -448,7 +568,16 @@ void ThreeXUiApi::request(const QByteArray& method, const QString& path, const Q
                               QStringLiteral("application/json"));
         }
     }
-    QNetworkReply* reply = method == "GET" ? network_->get(request) : network_->post(request, data);
+    QNetworkReply* reply = nullptr;
+    if (method == "GET") {
+        reply = network_->get(request);
+    } else {
+        request.setAttribute(QNetworkRequest::DoNotBufferUploadDataAttribute, true);
+        request.setHeader(QNetworkRequest::ContentLengthHeader, data.size());
+        auto* upload = new OneShotUpload(std::move(data));
+        reply = network_->post(request, upload);
+        upload->setParent(reply);
+    }
     reply->setReadBufferSize(kResponseLimit + 1);
     struct ResponseState {
         QByteArray bytes;
@@ -764,8 +893,7 @@ void ThreeXUiApi::fetchStatus(Callback<Snapshot> callback) {
 }
 
 void ThreeXUiApi::readClient(const Client& client, Callback<QJsonObject> callback) {
-    if (client.serverId != config_.id || !validEmail(client.email) || client.id.isEmpty() ||
-        client.inboundIds.isEmpty()) {
+    if (client.serverId != config_.id || !validEmail(client.email) || client.id.isEmpty()) {
         callback(Outcome<QJsonObject>::failure(identityError()));
         return;
     }
@@ -779,7 +907,7 @@ void ThreeXUiApi::readClient(const Client& client, Callback<QJsonObject> callbac
                     const QJsonObject response = result.value.toObject();
                     QJsonObject fresh = response.value(QStringLiteral("client")).toObject();
                     const auto ids = inboundIds(response.value(QStringLiteral("inboundIds")));
-                    if (fresh.isEmpty() || !sameIdentity(client, fresh, ids)) {
+                    if (fresh.isEmpty() || !ids.ok || !sameIdentity(client, fresh, ids.value)) {
                         callback(Outcome<QJsonObject>::failure(identityError()));
                         return;
                     }
@@ -830,93 +958,328 @@ void ThreeXUiApi::createClient(const ClientDraft& draft, Callback<bool> callback
             if (callback)
                 callback(std::move(result));
         };
-        if (!validEmail(draft.email) || draft.inboundId <= 0 || draft.totalBytes < 0 ||
-            (!draft.flow.isEmpty() && draft.flow != QStringLiteral("xtls-rprx-vision"))) {
+        QSet<int> seen;
+        constexpr qint64 exactIntegerMax = 9007199254740991LL;
+        bool valid = validEmail(draft.email) && !draft.inboundIds.isEmpty() &&
+                     draft.totalBytes >= 0 && draft.totalBytes <= exactIntegerMax &&
+                     draft.expiryTime >= -exactIntegerMax && draft.expiryTime <= exactIntegerMax &&
+                     (draft.flow.isEmpty() || draft.flow == QStringLiteral("xtls-rprx-vision"));
+        for (int id : draft.inboundIds) {
+            if (id <= 0 || seen.contains(id))
+                valid = false;
+            seen.insert(id);
+        }
+        if (!draft.clientId.isEmpty() && QUuid(draft.clientId).isNull())
+            valid = false;
+        for (const auto& secret : {draft.password, draft.subId}) {
+            if (secret.size() > 512)
+                valid = false;
+            for (const auto& character : secret) {
+                if (character.category() == QChar::Other_Control)
+                    valid = false;
+            }
+        }
+        for (const auto& character : draft.subId) {
+            if (character.isSpace() || character == QLatin1Char('/') ||
+                character == QLatin1Char('\\'))
+                valid = false;
+        }
+        if (!valid) {
             finish(Outcome<bool>::failure(QStringLiteral("Некорректные параметры клиента.")));
             return;
         }
-        prepare([this, draft, finish](Outcome<bool> prepared) mutable {
+        ClientDraft plan = draft;
+        if (plan.clientId.isEmpty())
+            plan.clientId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        if (plan.subId.isEmpty())
+            plan.subId = randomSecret(24);
+        prepare([this, plan, finish](Outcome<bool> prepared) mutable {
             if (!prepared.ok) {
                 finish(std::move(prepared));
                 return;
             }
+            if (detected_ == ApiFlavor::ModernV3) {
+                createModern(plan, finish);
+                return;
+            }
+            if (plan.inboundIds.size() != 1) {
+                finish(Outcome<bool>::failure(QStringLiteral(
+                    "API v2 поддерживает создание только на одном inbound. Записи не изменены.")));
+                return;
+            }
             request(
                 "GET", QStringLiteral("/panel/api/inbounds/list"), {},
-                [this, draft, finish](Outcome<QJsonValue> result) mutable {
-                    if (!result.ok || !result.value.isArray()) {
+                [this, plan, finish](Outcome<QJsonValue> response) mutable {
+                    if (!response.ok || !response.value.isArray()) {
                         finish(Outcome<bool>::failure(
-                            result.ok
+                            response.ok
                                 ? QStringLiteral("Панель вернула некорректный список inbound.")
-                                : result.error));
+                                : response.error));
                         return;
                     }
-                    const auto parsed =
-                        parseInventory(result.value.toArray(), {}, config_.id, true);
-                    if (!parsed.ok) {
-                        finish(Outcome<bool>::failure(parsed.error));
+                    const auto selected =
+                        selectedInbounds(response.value.toArray(), plan, config_.id);
+                    if (!selected.ok) {
+                        finish(Outcome<bool>::failure(selected.error));
                         return;
                     }
-                    auto selected = std::find_if(
-                        parsed.value.inbounds.cbegin(), parsed.value.inbounds.cend(),
-                        [draft](const Inbound& inbound) { return inbound.id == draft.inboundId; });
-                    if (selected == parsed.value.inbounds.cend() || !selected->enable) {
-                        finish(Outcome<bool>::failure(
-                            QStringLiteral("Inbound удалён или отключён. Обновите список.")));
+                    if (plan.password.isEmpty() &&
+                        selected.value.first().protocol == QStringLiteral("trojan"))
+                        plan.password = randomSecret(32);
+                    const auto inventory =
+                        parseInventory(response.value.toArray(), {}, config_.id, false);
+                    if (!inventory.ok) {
+                        finish(Outcome<bool>::failure(inventory.error));
                         return;
                     }
-                    const QString protocol = selected->protocol;
-                    if (protocol != QStringLiteral("vless") &&
-                        protocol != QStringLiteral("vmess") &&
-                        protocol != QStringLiteral("trojan")) {
-                        finish(Outcome<bool>::failure(QStringLiteral(
-                            "Создание клиента для этого протокола пока не поддерживается.")));
+                    const Client* existing = nullptr;
+                    for (const auto& client : inventory.value.clients) {
+                        if (client.email.compare(plan.email, Qt::CaseInsensitive) == 0) {
+                            if (existing) {
+                                finish(Outcome<bool>::failure(collisionError()));
+                                return;
+                            }
+                            existing = &client;
+                        } else if (client.subId == plan.subId || client.id == plan.clientId ||
+                                   (selected.value.first().protocol == QStringLiteral("trojan") &&
+                                    client.raw.value(QStringLiteral("password")).toString() ==
+                                        plan.password)) {
+                            finish(Outcome<bool>::failure(collisionError()));
+                            return;
+                        }
+                    }
+                    if (existing) {
+                        const bool same = existing->email == plan.email &&
+                                          sameInboundIds(existing->inboundIds, plan.inboundIds) &&
+                                          matchesDraft(existing->raw, plan, true,
+                                                       selected.value.first().protocol);
+                        finish(same ? Outcome<bool>::success(true)
+                                    : Outcome<bool>::failure(collisionError()));
                         return;
                     }
-                    if (!draft.flow.isEmpty() && protocol != QStringLiteral("vless")) {
-                        finish(Outcome<bool>::failure(
-                            QStringLiteral("Flow xtls-rprx-vision доступен только для VLESS.")));
-                        return;
-                    }
-                    QJsonObject client{{QStringLiteral("email"), draft.email},
-                                       {QStringLiteral("totalGB"), draft.totalBytes},
-                                       {QStringLiteral("expiryTime"), draft.expiryTime},
-                                       {QStringLiteral("enable"), draft.enable},
-                                       {QStringLiteral("subId"), randomSecret(24)},
-                                       {QStringLiteral("flow"), draft.flow},
-                                       {QStringLiteral("limitIp"), 0},
-                                       {QStringLiteral("limitHwid"), 0},
-                                       {QStringLiteral("tgId"), 0},
-                                       {QStringLiteral("comment"), QString()},
-                                       {QStringLiteral("reset"), 0}};
-                    if (protocol == QStringLiteral("trojan"))
-                        client.insert(QStringLiteral("password"), randomSecret(32));
-                    if (protocol != QStringLiteral("trojan") || detected_ == ApiFlavor::ModernV3)
-                        client.insert(QStringLiteral("id"),
-                                      QUuid::createUuid().toString(QUuid::WithoutBraces));
-                    if (protocol == QStringLiteral("vmess"))
-                        client.insert(QStringLiteral("security"), QStringLiteral("auto"));
-                    auto done = [finish](Outcome<QJsonValue> result) mutable {
-                        finish(result.ok ? Outcome<bool>::success(true)
-                                         : Outcome<bool>::failure(result.error));
-                    };
-                    if (detected_ == ApiFlavor::ModernV3) {
-                        request("POST", QStringLiteral("/panel/api/clients/add"),
-                                {{QStringLiteral("client"), client},
-                                 {QStringLiteral("inboundIds"), QJsonArray{draft.inboundId}}},
-                                done, false, true);
-                    } else {
-                        const QString settings =
-                            QString::fromUtf8(QJsonDocument(QJsonObject{{QStringLiteral("clients"),
-                                                                         QJsonArray{client}}})
-                                                  .toJson(QJsonDocument::Compact));
-                        request("POST", QStringLiteral("/panel/api/inbounds/addClient"),
-                                {{QStringLiteral("id"), draft.inboundId},
-                                 {QStringLiteral("settings"), settings}},
-                                done, true, true);
-                    }
+                    const auto client = newClient(plan, selected.value, false);
+                    const QString settings = QString::fromUtf8(
+                        QJsonDocument(QJsonObject{{QStringLiteral("clients"), QJsonArray{client}}})
+                            .toJson(QJsonDocument::Compact));
+                    request(
+                        "POST", QStringLiteral("/panel/api/inbounds/addClient"),
+                        {{QStringLiteral("id"), plan.inboundIds.first()},
+                         {QStringLiteral("settings"), settings}},
+                        [finish](Outcome<QJsonValue> result) mutable {
+                            finish(result.ok ? Outcome<bool>::success(true)
+                                             : Outcome<bool>::failure(result.error));
+                        },
+                        true, true);
                 });
         });
     });
+}
+
+void ThreeXUiApi::createModern(const ClientDraft& initialPlan, Callback<bool> callback) {
+    request(
+        "GET", QStringLiteral("/panel/api/inbounds/list"), {},
+        [this, plan = initialPlan,
+         callback = std::move(callback)](Outcome<QJsonValue> response) mutable {
+            if (!response.ok || !response.value.isArray()) {
+                callback(Outcome<bool>::failure(
+                    response.ok ? QStringLiteral("Панель вернула некорректный список inbound.")
+                                : response.error));
+                return;
+            }
+            const auto selected = selectedInbounds(response.value.toArray(), plan, config_.id);
+            if (!selected.ok) {
+                callback(Outcome<bool>::failure(selected.error));
+                return;
+            }
+            bool vmess = false;
+            bool trojan = false;
+            for (const auto& inbound : selected.value) {
+                vmess |= inbound.protocol == QStringLiteral("vmess");
+                trojan |= inbound.protocol == QStringLiteral("trojan");
+                if (inbound.protocol == QStringLiteral("trojan") && plan.password.isEmpty())
+                    plan.password = randomSecret(32);
+            }
+            const auto client = newClient(plan, selected.value, true);
+            request(
+                "GET", QStringLiteral("/panel/api/clients/list"), {},
+                [this, plan, client, vmess, trojan,
+                 callback = std::move(callback)](Outcome<QJsonValue> listed) mutable {
+                    if (!listed.ok || !listed.value.isArray()) {
+                        callback(Outcome<bool>::failure(
+                            listed.ok
+                                ? QStringLiteral("Панель вернула некорректный список клиентов.")
+                                : listed.error));
+                        return;
+                    }
+                    bool exists = false;
+                    for (const auto& entry : listed.value.toArray()) {
+                        if (!entry.isObject()) {
+                            callback(Outcome<bool>::failure(
+                                QStringLiteral("Панель вернула некорректного клиента.")));
+                            return;
+                        }
+                        const auto raw = entry.toObject();
+                        if (raw.value(QStringLiteral("email"))
+                                .toString()
+                                .compare(plan.email, Qt::CaseInsensitive) == 0) {
+                            if (exists ||
+                                raw.value(QStringLiteral("email")).toString() != plan.email) {
+                                callback(Outcome<bool>::failure(collisionError()));
+                                return;
+                            }
+                            exists = true;
+                        } else if (raw.value(QStringLiteral("subId")).toString() == plan.subId ||
+                                   identifier(raw) == plan.clientId ||
+                                   (trojan && raw.value(QStringLiteral("password")).toString() ==
+                                                  plan.password)) {
+                            callback(Outcome<bool>::failure(collisionError()));
+                            return;
+                        }
+                    }
+                    if (!exists) {
+                        request(
+                            "POST", QStringLiteral("/panel/api/clients/add"),
+                            {{QStringLiteral("client"), client},
+                             {QStringLiteral("inboundIds"), jsonIds(plan.inboundIds)}},
+                            [this, plan, vmess,
+                             callback = std::move(callback)](Outcome<QJsonValue> result) mutable {
+                                if (!result.ok) {
+                                    callback(Outcome<bool>::failure(result.error));
+                                    return;
+                                }
+                                verifyCreated(plan, true,
+                                              QStringLiteral("Клиент создан, но его состояние не "
+                                                             "подтверждено. Обновите список. "),
+                                              std::move(callback), vmess);
+                            },
+                            false, true);
+                        return;
+                    }
+                    request(
+                        "GET",
+                        QStringLiteral("/panel/api/clients/get/") + encodedSegment(plan.email), {},
+                        [this, plan, vmess,
+                         callback = std::move(callback)](Outcome<QJsonValue> result) mutable {
+                            if (!result.ok) {
+                                callback(Outcome<bool>::failure(result.error));
+                                return;
+                            }
+                            const auto object = result.value.toObject();
+                            const auto raw = object.value(QStringLiteral("client")).toObject();
+                            const auto ids = inboundIds(object.value(QStringLiteral("inboundIds")));
+                            if (!ids.ok || !matchesDraft(raw, plan, true, {}, vmess)) {
+                                callback(Outcome<bool>::failure(collisionError()));
+                                return;
+                            }
+                            QList<int> missing;
+                            for (int id : ids.value) {
+                                if (!plan.inboundIds.contains(id)) {
+                                    callback(Outcome<bool>::failure(collisionError()));
+                                    return;
+                                }
+                            }
+                            for (int id : plan.inboundIds)
+                                if (!ids.value.contains(id))
+                                    missing.append(id);
+                            if (missing.isEmpty()) {
+                                callback(Outcome<bool>::success(true));
+                                return;
+                            }
+                            // Attach is additive; never re-run add, patch another record's
+                            // fields, or detach a binding to force the requested shape.
+                            request(
+                                "GET", QStringLiteral("/panel/api/inbounds/list"), {},
+                                [this, plan, missing, vmess, callback = std::move(callback)](
+                                    Outcome<QJsonValue> refreshed) mutable {
+                                    if (!refreshed.ok || !refreshed.value.isArray()) {
+                                        callback(Outcome<bool>::failure(
+                                            refreshed.ok
+                                                ? QStringLiteral(
+                                                      "Панель вернула некорректный список inbound.")
+                                                : refreshed.error));
+                                        return;
+                                    }
+                                    const auto selected = selectedInbounds(
+                                        refreshed.value.toArray(), plan, config_.id);
+                                    if (!selected.ok) {
+                                        callback(Outcome<bool>::failure(selected.error));
+                                        return;
+                                    }
+                                    request(
+                                        "POST",
+                                        QStringLiteral("/panel/api/clients/") +
+                                            encodedSegment(plan.email) + QStringLiteral("/attach"),
+                                        {{QStringLiteral("inboundIds"), jsonIds(missing)}},
+                                        [this, plan, vmess, callback = std::move(callback)](
+                                            Outcome<QJsonValue> attached) mutable {
+                                            if (!attached.ok) {
+                                                callback(Outcome<bool>::failure(attached.error));
+                                                return;
+                                            }
+                                            verifyCreated(
+                                                plan, false,
+                                                QStringLiteral(
+                                                    "Привязка отправлена, но её состояние не "
+                                                    "подтверждено. Обновите список. "),
+                                                std::move(callback), vmess);
+                                        },
+                                        false, true);
+                                });
+                        });
+                });
+        });
+}
+
+void ThreeXUiApi::verifyCreated(const ClientDraft& plan, bool mayDisable,
+                                const QString& partialError, Callback<bool> callback, bool vmess) {
+    request("GET", QStringLiteral("/panel/api/clients/get/") + encodedSegment(plan.email), {},
+            [this, plan, mayDisable, partialError, vmess,
+             callback = std::move(callback)](Outcome<QJsonValue> result) mutable {
+                if (!result.ok) {
+                    callback(Outcome<bool>::failure(partialError + result.error));
+                    return;
+                }
+                const auto response = result.value.toObject();
+                const auto raw = response.value(QStringLiteral("client")).toObject();
+                const auto ids = inboundIds(response.value(QStringLiteral("inboundIds")));
+                if (!ids.ok || !sameInboundIds(ids.value, plan.inboundIds) ||
+                    !matchesDraft(raw, plan, !mayDisable, {}, vmess)) {
+                    callback(Outcome<bool>::failure(
+                        partialError +
+                        QStringLiteral("Идентификаторы, ограничения или привязки отличаются.")));
+                    return;
+                }
+                if (mayDisable && !plan.enable && raw.value(QStringLiteral("enable")).toBool()) {
+                    auto model = modernModel(raw, {});
+                    if (!model.ok) {
+                        callback(Outcome<bool>::failure(partialError + model.error));
+                        return;
+                    }
+                    model.value.insert(QStringLiteral("enable"), false);
+                    request(
+                        "POST",
+                        QStringLiteral("/panel/api/clients/update/") + encodedSegment(plan.email),
+                        model.value,
+                        [this, plan, vmess,
+                         callback = std::move(callback)](Outcome<QJsonValue> updated) mutable {
+                            const auto partial = QStringLiteral(
+                                "Клиент создан, но отключение не подтверждено. Обновите список. ");
+                            if (!updated.ok) {
+                                callback(Outcome<bool>::failure(partial + updated.error));
+                                return;
+                            }
+                            verifyCreated(plan, false, partial, std::move(callback), vmess);
+                        },
+                        false, true);
+                    return;
+                }
+                if (raw.value(QStringLiteral("enable")).toBool() != plan.enable) {
+                    callback(Outcome<bool>::failure(
+                        partialError + QStringLiteral("Состояние enable отличается.")));
+                    return;
+                }
+                callback(Outcome<bool>::success(true));
+            });
 }
 
 void ThreeXUiApi::mutate(const Client& client, const ClientPatch& patch, Mutation mutation,
@@ -1057,6 +1420,221 @@ void ThreeXUiApi::serverAction(ServerAction action, const QString& version,
                                      : Outcome<bool>::failure(result.error));
                 },
                 false, true);
+        });
+    });
+}
+void ThreeXUiApi::binaryRequest(const QString& path, const QByteArray& upload,
+                                const QByteArray& contentType, Callback<QByteArray> callback,
+                                qint64 limit, int timeoutMs, bool mutation) {
+    lastHttpStatus_ = 0;
+    const auto validated = validatePanelUrl(config_);
+    if (!validated.ok || !network_) {
+        callback(Outcome<QByteArray>::failure(
+            validated.ok ? QStringLiteral("Сетевой менеджер недоступен.") : validated.error));
+        return;
+    }
+    QUrl url = validated.value;
+    url.setPath(url.path(QUrl::FullyEncoded) +
+                    (path.startsWith(QLatin1Char('/')) ? path.mid(1) : path),
+                QUrl::StrictMode);
+    QNetworkRequest request(url);
+    request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
+                         QNetworkRequest::ManualRedirectPolicy);
+    request.setTransferTimeout(timeoutMs);
+    request.setRawHeader("Accept", mutation ? "application/json" : "application/octet-stream");
+    request.setRawHeader("X-Requested-With", "XMLHttpRequest");
+    if (config_.auth == AuthKind::Token)
+        request.setRawHeader("Authorization", "Bearer " + config_.token.toUtf8());
+    if (mutation && !csrf_.isEmpty())
+        request.setRawHeader("X-CSRF-Token", csrf_.toUtf8());
+    QNetworkReply* reply = nullptr;
+    if (mutation) {
+        request.setRawHeader("Content-Type", contentType);
+        request.setHeader(QNetworkRequest::ContentLengthHeader, upload.size());
+        request.setAttribute(QNetworkRequest::DoNotBufferUploadDataAttribute, true);
+        auto* device = new OneShotUpload(upload);
+        reply = network_->post(request, device);
+        device->setParent(reply);
+    } else {
+        reply = network_->get(request);
+    }
+    reply->setReadBufferSize(limit + 1);
+    struct State {
+        QByteArray bytes;
+        bool tooLarge = false;
+        bool timedOut = false;
+        bool delivered = false;
+        QElapsedTimer clock;
+    };
+    auto state = std::make_shared<State>();
+    state->clock.start();
+    auto* timer = new QTimer(reply);
+    timer->setSingleShot(true);
+    connect(timer, &QTimer::timeout, reply, [state, reply] {
+        state->timedOut = true;
+        reply->abort();
+    });
+    timer->start(timeoutMs);
+    auto read = [state, reply, limit] {
+        const qint64 left = limit + 1 - state->bytes.size();
+        if (left > 0)
+            state->bytes.append(reply->read(left));
+        if (state->bytes.size() > limit || reply->bytesAvailable() > 0) {
+            state->tooLarge = true;
+            reply->abort();
+        }
+    };
+    connect(reply, &QNetworkReply::metaDataChanged, this, [reply, state, limit] {
+        if (reply->header(QNetworkRequest::ContentLengthHeader).toLongLong() > limit) {
+            state->tooLarge = true;
+            reply->abort();
+        }
+    });
+    connect(reply, &QIODevice::readyRead, this, read);
+    connect(this, &QObject::destroyed, reply, [reply] {
+        reply->disconnect();
+        reply->abort();
+        reply->deleteLater();
+    });
+    connect(
+        reply, &QNetworkReply::finished, this,
+        [this, reply, timer, state, read, callback = std::move(callback), mutation,
+         limit]() mutable {
+            if (state->delivered)
+                return;
+            state->delivered = true;
+            timer->stop();
+            if (reply->isOpen())
+                read();
+            lastHttpStatus_ = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+            lastLatencyMs_ = static_cast<int>(
+                std::min<qint64>(state->clock.elapsed(), std::numeric_limits<int>::max()));
+            const int status = lastHttpStatus_;
+            const auto error = reply->error();
+            reply->deleteLater();
+            if (status == 401 || status == 403)
+                loggedIn_ = false;
+            QString message;
+            if (state->tooLarge)
+                message = QStringLiteral("Ответ панели превышает лимит %1 МиБ.")
+                              .arg(limit / (1024 * 1024));
+            else if (state->timedOut || error == QNetworkReply::TimeoutError)
+                message = mutation
+                              ? QStringLiteral("Время ожидания истекло: результат восстановления "
+                                               "неизвестен. Проверьте панель перед повторением.")
+                              : QStringLiteral("Время ожидания загрузки базы истекло.");
+            else if (status >= 300 && status < 400)
+                message =
+                    QStringLiteral("Панель перенаправляет запрос. Укажите конечный URL панели.");
+            else if (status == 401 || status == 403)
+                message = QStringLiteral("Панель отклонила авторизацию. Проверьте подключение.");
+            else if (status >= 400)
+                message = QStringLiteral("Панель вернула HTTP %1.").arg(status);
+            else if (error != QNetworkReply::NoError || status < 200 || status >= 300)
+                message = mutation
+                              ? QStringLiteral("Ошибка соединения: результат восстановления "
+                                               "неизвестен. Проверьте панель перед повторением.")
+                              : QStringLiteral("Не удалось загрузить базу панели.");
+            if (!message.isEmpty()) {
+                callback(Outcome<QByteArray>::failure(message));
+                return;
+            }
+            callback(Outcome<QByteArray>::success(std::move(state->bytes)));
+        });
+}
+
+void ThreeXUiApi::downloadDatabase(Callback<QByteArray> callback) {
+    enqueue([this, callback = std::move(callback)]() mutable {
+        auto finish = [this, callback = std::move(callback)](Outcome<QByteArray> result) mutable {
+            complete();
+            if (callback)
+                callback(std::move(result));
+        };
+        authenticate([this, finish](Outcome<bool> authenticated) mutable {
+            if (!authenticated.ok) {
+                finish(Outcome<QByteArray>::failure(authenticated.error));
+                return;
+            }
+            binaryRequest(
+                QStringLiteral("/panel/api/server/getDb"), {}, {},
+                [finish](Outcome<QByteArray> result) mutable {
+                    if (!result.ok) {
+                        finish(std::move(result));
+                        return;
+                    }
+                    const auto inspected = inspectDatabaseBackup(result.value);
+                    finish(inspected.ok ? std::move(result)
+                                        : Outcome<QByteArray>::failure(inspected.error));
+                },
+                MaximumBackupBytes, 60000, false);
+        });
+    });
+}
+
+void ThreeXUiApi::restoreDatabase(const QByteArray& data, bool keepHostSettings,
+                                  Callback<bool> callback) {
+    enqueue([this, data, keepHostSettings, callback = std::move(callback)]() mutable {
+        auto finish = [this, callback = std::move(callback)](Outcome<bool> result) mutable {
+            complete();
+            if (callback)
+                callback(std::move(result));
+        };
+        const auto inspected = inspectDatabaseBackup(data);
+        if (!inspected.ok) {
+            finish(Outcome<bool>::failure(inspected.error));
+            return;
+        }
+        authenticate([this, data, keepHostSettings, info = inspected.value,
+                      finish](Outcome<bool> authenticated) mutable {
+            if (!authenticated.ok) {
+                finish(std::move(authenticated));
+                return;
+            }
+            QByteArray boundary;
+            do {
+                boundary = "3x-control-" + QUuid::createUuid().toString(QUuid::Id128).toLatin1();
+            } while (data.contains(boundary));
+            const QByteArray fileHeader =
+                "--" + boundary +
+                "\r\nContent-Disposition: form-data; name=\"db\"; filename=\"fleet" +
+                info.extension().toLatin1() +
+                "\"\r\nContent-Type: application/octet-stream\r\n\r\n";
+            const QByteArray footer =
+                "\r\n--" + boundary +
+                "\r\nContent-Disposition: form-data; name=\"keepHostSettings\"\r\n\r\n" +
+                (keepHostSettings ? "true" : "false") + "\r\n--" + boundary + "--\r\n";
+            QByteArray upload;
+            upload.reserve(fileHeader.size() + data.size() + footer.size());
+            upload.append(fileHeader);
+            upload.append(data);
+            upload.append(footer);
+            binaryRequest(
+                QStringLiteral("/panel/api/server/importDB"), upload,
+                "multipart/form-data; boundary=" + boundary,
+                [this, finish](Outcome<QByteArray> result) mutable {
+                    if (!result.ok) {
+                        finish(Outcome<bool>::failure(result.error));
+                        return;
+                    }
+                    QJsonParseError error;
+                    const auto document = QJsonDocument::fromJson(result.value, &error);
+                    const auto success = document.object().value(QStringLiteral("success"));
+                    if (error.error != QJsonParseError::NoError || !document.isObject() ||
+                        !success.isBool() || !success.toBool()) {
+                        if (config_.auth == AuthKind::Password)
+                            loggedIn_ = false;
+                        finish(Outcome<bool>::failure(QStringLiteral(
+                            "Панель не подтвердила восстановление базы. Проверьте её состояние.")));
+                        return;
+                    }
+                    // Imported panel settings may invalidate every session and
+                    // change API version. Keep no stale CSRF/detection state.
+                    loggedIn_ = false;
+                    csrf_.clear();
+                    detected_ = config_.api;
+                    finish(Outcome<bool>::success(true));
+                },
+                kResponseLimit, 120000, true);
         });
     });
 }

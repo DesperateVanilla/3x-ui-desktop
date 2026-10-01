@@ -7,12 +7,17 @@
 #include <QDialogButtonBox>
 #include <QDoubleSpinBox>
 #include <QFormLayout>
+#include <QHBoxLayout>
+#include <QHeaderView>
 #include <QLabel>
 #include <QLineEdit>
 #include <QPushButton>
+#include <QScreen>
+#include <QScrollArea>
 #include <QSignalBlocker>
 #include <QStringList>
 #include <QTimeZone>
+#include <QTreeWidget>
 #include <QUuid>
 #include <QVBoxLayout>
 #include <memory>
@@ -21,7 +26,10 @@ namespace fleet {
 namespace {
 constexpr qint64 bytesPerGb = 1024LL * 1024LL * 1024LL;
 constexpr double maximumQuotaGb = 1000000.0;
-constexpr int protocolRole = Qt::UserRole + 1;
+constexpr int serverIdRole = Qt::UserRole;
+constexpr int inboundIdRole = Qt::UserRole + 1;
+constexpr int protocolRole = Qt::UserRole + 2;
+constexpr int availableRole = Qt::UserRole + 3;
 
 QLabel* helperLabel(const QString& text, QWidget* parent) {
     auto* label = new QLabel(text, parent);
@@ -67,11 +75,62 @@ QString inboundTitle(const Inbound& inbound) {
         .arg(inbound.port);
 }
 
+QString serverTitle(const ServerConfig& server) {
+    QString title = server.name.isEmpty() ? server.panelUrl.host() : server.name;
+    if (!server.location.isEmpty())
+        title += QStringLiteral(" · ") + server.location;
+    return title;
+}
+
+struct TargetSelection {
+    QList<ClientTarget> targets;
+    int inboundCount = 0;
+    bool allVless = false;
+    bool invalid = false;
+};
+
+TargetSelection selectedTargets(const QTreeWidget* tree) {
+    TargetSelection selection;
+    QHash<QString, int> serverPositions;
+    bool allVless = true;
+    for (int i = 0; i < tree->topLevelItemCount(); ++i) {
+        const auto* server = tree->topLevelItem(i);
+        const QString serverId = server->data(0, serverIdRole).toString();
+        for (int j = 0; j < server->childCount(); ++j) {
+            const auto* inbound = server->child(j);
+            if (inbound->checkState(0) != Qt::Checked)
+                continue;
+            const int id = inbound->data(0, inboundIdRole).toInt();
+            const QString protocol = inbound->data(0, protocolRole).toString();
+            if (serverId.isEmpty() || id <= 0 || !inbound->data(0, availableRole).toBool() ||
+                !(inbound->flags() & Qt::ItemIsEnabled) || !supportedProtocol(protocol)) {
+                selection.invalid = true;
+                continue;
+            }
+            int position = serverPositions.value(serverId, -1);
+            if (position < 0) {
+                position = static_cast<int>(selection.targets.size());
+                serverPositions.insert(serverId, position);
+                selection.targets.append({serverId, {}});
+            }
+            auto& ids = selection.targets[position].inboundIds;
+            if (!ids.contains(id)) {
+                ids.append(id);
+                ++selection.inboundCount;
+            }
+            allVless = allVless && protocol == QStringLiteral("vless");
+        }
+    }
+    selection.allVless = selection.inboundCount > 0 && allVless && !selection.invalid;
+    return selection;
+}
+
 bool validEmail(const QString& email) {
     if (email.isEmpty() || email.size() > 128)
         return false;
     for (const QChar character : email) {
-        if (character == QLatin1Char('/') || character == QLatin1Char('?') ||
+        if (character.isSpace() || character == QLatin1Char('\\') ||
+            character == QLatin1Char('/') || character == QLatin1Char('?') ||
             character == QLatin1Char('#') || character.category() == QChar::Other_Control)
             return false;
     }
@@ -276,35 +335,54 @@ ServerConfig ServerDialog::result() const {
 
 ClientDialog::ClientDialog(const QList<ServerConfig>& servers,
                            const QHash<QString, Inventory>& inventories,
-                           const std::optional<Client>& existing, QWidget* parent)
+                           const std::optional<Client>& existing, QWidget* parent,
+                           const QString& masterServerId)
     : QDialog(parent) {
     const bool editing = existing.has_value();
     setWindowTitle(editing ? tr("Редактировать клиента") : tr("Добавить клиента"));
-    setMinimumWidth(540);
-    resize(560, 540);
+    const QSize screenSize = screen() ? screen()->availableGeometry().size() : QSize(1280, 720);
+    const int maximumWidth = qMax(1, screenSize.width() - 40);
+    const int maximumHeight = qMax(1, screenSize.height() - 60);
+    setMinimumWidth(qMin(editing ? 540 : 640, maximumWidth));
+    setMaximumSize(maximumWidth, maximumHeight);
+    resize(qMin(editing ? 560 : 740, maximumWidth), qMin(editing ? 540 : 720, maximumHeight));
 
     auto* layout = new QVBoxLayout(this);
     layout->setSpacing(12);
     layout->addWidget(
         helperLabel(editing ? tr("Измените лимит трафика, срок действия или состояние клиента.")
-                            : tr("Выберите сервер и активный inbound VLESS, VMess или Trojan."),
+                            : tr("Выберите inbound VLESS, VMess или Trojan на одном или "
+                                 "нескольких серверах."),
                     this));
-    auto* form = new QFormLayout;
+    auto* formContainer = new QWidget(this);
+    auto* form = new QFormLayout(formContainer);
     form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
     form->setSpacing(10);
-    layout->addLayout(form);
-
-    auto* server = new QComboBox(this);
-    server->setObjectName(QStringLiteral("server"));
-    server->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
-    server->setMinimumContentsLength(24);
-    for (const auto& config : servers) {
-        QString title = config.name.isEmpty() ? config.panelUrl.host() : config.name;
-        if (!config.location.isEmpty())
-            title += QStringLiteral(" · ") + config.location;
-        server->addItem(title, config.id);
-    }
     if (editing) {
+        layout->addWidget(formContainer);
+    } else {
+        auto* scroll = new QScrollArea(this);
+        scroll->setObjectName(QStringLiteral("clientFormScroll"));
+        scroll->setWidgetResizable(true);
+        scroll->setFrameShape(QFrame::NoFrame);
+        scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        scroll->setWidget(formContainer);
+        layout->addWidget(scroll, 1);
+    }
+
+    QTreeWidget* targetTree = nullptr;
+    QLabel* selectionCount = nullptr;
+    QLabel* masterLink = nullptr;
+    QString masterName;
+    QPushButton* selectAll = nullptr;
+    QPushButton* clearSelection = nullptr;
+    if (editing) {
+        auto* server = new QComboBox(this);
+        server->setObjectName(QStringLiteral("server"));
+        server->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+        server->setMinimumContentsLength(24);
+        for (const auto& config : servers)
+            server->addItem(serverTitle(config), config.id);
         int selected = server->findData(existing->serverId);
         if (selected < 0) {
             server->addItem(tr("Сервер недоступен"), existing->serverId);
@@ -312,20 +390,137 @@ ClientDialog::ClientDialog(const QList<ServerConfig>& servers,
         }
         server->setCurrentIndex(selected);
         serverId_ = existing->serverId;
-    } else if (server->count() == 0) {
-        server->addItem(tr("Нет добавленных серверов"));
         server->setEnabled(false);
+        targets_ = {{existing->serverId, existing->inboundIds}};
+        form->addRow(tr("&Сервер:"), server);
+        auto* inbound = new QComboBox(this);
+        inbound->setObjectName(QStringLiteral("inbound"));
+        inbound->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+        inbound->setMinimumContentsLength(24);
+        const Inventory inventory = inventories.value(existing->serverId);
+        QStringList titles;
+        for (int id : existing->inboundIds) {
+            QString title = tr("Inbound №%1").arg(id);
+            for (const auto& item : inventory.inbounds) {
+                if (item.id == id) {
+                    title = inboundTitle(item);
+                    break;
+                }
+            }
+            titles.append(title);
+        }
+        inbound->addItem(titles.isEmpty() ? tr("Inbound недоступен")
+                                          : titles.join(QStringLiteral("; ")));
+        inbound->setEnabled(false);
+        form->addRow(tr("&Inbound:"), inbound);
+        form->addRow(helperLabel(
+            existing->inboundIds.size() > 1
+                ? tr("Изменения применятся к клиенту на всех его inbound на этом сервере.")
+                : tr("Сервер, inbound и имя клиента сохраняются."),
+            this));
+    } else {
+        targetTree = new QTreeWidget(this);
+        targetTree->setObjectName(QStringLiteral("targetTree"));
+        targetTree->setAccessibleName(tr("Серверы и inbound для создания клиента"));
+        targetTree->setColumnCount(2);
+        targetTree->setHeaderLabels({tr("Сервер / inbound"), tr("Состояние")});
+        targetTree->setRootIsDecorated(true);
+        targetTree->setUniformRowHeights(true);
+        targetTree->setSortingEnabled(false);
+        targetTree->setMinimumHeight(180);
+        targetTree->header()->setSectionResizeMode(0, QHeaderView::Stretch);
+        targetTree->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+        form->addRow(targetTree);
+        bool anyAvailable = false;
+        for (const auto& config : servers) {
+            const bool isMaster = !masterServerId.isEmpty() && config.id == masterServerId;
+            if (isMaster)
+                masterName = serverTitle(config);
+            auto* node = new QTreeWidgetItem(targetTree);
+            node->setText(0, serverTitle(config) + (isMaster ? tr(" · мастер") : QString()));
+            node->setData(0, serverIdRole, config.id);
+            node->setFlags(Qt::ItemIsSelectable | Qt::ItemIsEnabled | Qt::ItemIsUserCheckable);
+            node->setCheckState(0, Qt::Unchecked);
+            const auto inventory = inventories.constFind(config.id);
+            int availableCount = 0;
+            if (inventory == inventories.constEnd()) {
+                node->setText(1, tr("Список не загружен"));
+                auto* missing = new QTreeWidgetItem(node);
+                missing->setText(0, tr("Обновите список сервера"));
+                missing->setText(1, tr("Недоступен"));
+                missing->setDisabled(true);
+            } else {
+                for (const auto& item : inventory->inbounds) {
+                    QStringList reasons;
+                    if (!item.enable)
+                        reasons.append(tr("Выключен"));
+                    if (!supportedProtocol(item.protocol))
+                        reasons.append(tr("Протокол не поддерживается"));
+                    if (item.id <= 0)
+                        reasons.append(tr("Неверный идентификатор"));
+                    if (config.id.isEmpty() ||
+                        (!item.serverId.isEmpty() && item.serverId != config.id))
+                        reasons.append(tr("Привязка к серверу некорректна"));
+                    const bool available = reasons.isEmpty();
+                    auto* child = new QTreeWidgetItem(node);
+                    child->setText(0, inboundTitle(item));
+                    child->setText(1, available ? tr("Доступен")
+                                                : reasons.join(QStringLiteral(" · ")));
+                    child->setToolTip(1, child->text(1));
+                    child->setData(0, serverIdRole, config.id);
+                    child->setData(0, inboundIdRole, item.id);
+                    child->setData(0, protocolRole, item.protocol.toLower());
+                    child->setData(0, availableRole, available);
+                    child->setFlags(Qt::ItemIsSelectable | Qt::ItemIsEnabled |
+                                    Qt::ItemIsUserCheckable);
+                    child->setCheckState(0, available && isMaster ? Qt::Checked : Qt::Unchecked);
+                    child->setDisabled(!available);
+                    if (available)
+                        ++availableCount;
+                }
+                node->setText(1, tr("Доступно inbound: %1").arg(availableCount));
+                if (inventory->inbounds.isEmpty()) {
+                    auto* empty = new QTreeWidgetItem(node);
+                    empty->setText(0, tr("Нет inbound"));
+                    empty->setText(1, tr("Создайте inbound в панели"));
+                    empty->setDisabled(true);
+                }
+            }
+            node->setDisabled(availableCount == 0);
+            node->setExpanded(true);
+            anyAvailable = anyAvailable || availableCount > 0;
+        }
+        if (servers.isEmpty()) {
+            auto* empty = new QTreeWidgetItem(targetTree);
+            empty->setText(0, tr("Нет добавленных серверов"));
+            empty->setText(1, tr("Добавьте сервер"));
+            empty->setDisabled(true);
+        }
+        auto* selectionButtons = new QHBoxLayout;
+        selectAll = new QPushButton(tr("Выбрать все"), this);
+        selectAll->setObjectName(QStringLiteral("selectAllTargets"));
+        selectAll->setEnabled(anyAvailable);
+        clearSelection = new QPushButton(tr("Снять выбор"), this);
+        clearSelection->setObjectName(QStringLiteral("clearTargets"));
+        clearSelection->setEnabled(!servers.isEmpty());
+        selectionButtons->addWidget(selectAll);
+        selectionButtons->addWidget(clearSelection);
+        selectionButtons->addStretch();
+        form->addRow(selectionButtons);
+        selectionCount = helperLabel({}, this);
+        selectionCount->setObjectName(QStringLiteral("selectionCount"));
+        selectionCount->setAccessibleName(tr("Количество выбранных серверов и inbound"));
+        form->addRow(selectionCount);
+        auto* sharedIdentifiers =
+            helperLabel(tr("Все выбранные серверы получат общие UUID и subId, "
+                           "созданные автоматически. Для Trojan пароль также общий."),
+                        this);
+        sharedIdentifiers->setObjectName(QStringLiteral("sharedIdentifiers"));
+        form->addRow(sharedIdentifiers);
+        masterLink = helperLabel({}, this);
+        masterLink->setObjectName(QStringLiteral("masterSubscriptionHelp"));
+        form->addRow(masterLink);
     }
-    server->setEnabled(!editing && !servers.isEmpty());
-    form->addRow(tr("&Сервер:"), server);
-
-    auto* inbound = new QComboBox(this);
-    inbound->setObjectName(QStringLiteral("inbound"));
-    inbound->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
-    inbound->setMinimumContentsLength(24);
-    form->addRow(tr("&Inbound:"), inbound);
-    auto* inboundHelp = helperLabel({}, this);
-    form->addRow(inboundHelp);
 
     auto* email = new QLineEdit(this);
     email->setObjectName(QStringLiteral("email"));
@@ -338,7 +533,9 @@ ClientDialog::ClientDialog(const QList<ServerConfig>& servers,
     }
     form->addRow(tr("&Email / имя:"), email);
     if (!editing) {
-        form->addRow(helperLabel(tr("До 128 символов; без /, ?, # и управляющих символов."), this));
+        form->addRow(helperLabel(tr("До 128 символов; без пробелов, \\, /, ?, # "
+                                    "и управляющих символов."),
+                                 this));
     }
 
     auto* quota = new QDoubleSpinBox(this);
@@ -350,7 +547,8 @@ ClientDialog::ClientDialog(const QList<ServerConfig>& servers,
     quota->setKeyboardTracking(false);
     quota->setValue(editing ? static_cast<double>(existing->totalBytes) / bytesPerGb : 0.0);
     form->addRow(tr("Лимит &трафика:"), quota);
-    QString quotaHelpText = tr("0 ГБ — без ограничения. 1 ГБ = 1024³ байт.");
+    QString quotaHelpText = tr("0 ГБ — без ограничения. 1 ГБ = 1024³ байт. "
+                               "Квота применяется отдельно на каждом сервере.");
     if (editing && static_cast<double>(existing->totalBytes) / bytesPerGb > maximumQuotaGb) {
         quotaHelpText += tr(" Текущий лимит: %1 байт. Он превышает диапазон поля "
                             "и сохранится, пока вы не измените поле.")
@@ -435,13 +633,13 @@ ClientDialog::ClientDialog(const QList<ServerConfig>& servers,
     flow->addItem(tr("Без flow"), QString());
     flow->addItem(QStringLiteral("xtls-rprx-vision"), QStringLiteral("xtls-rprx-vision"));
     form->addRow(tr("&Flow (VLESS):"), flow);
-    auto* flowHelp =
-        helperLabel(tr("Vision должен поддерживаться настройками выбранного inbound."), this);
+    auto* flowHelp = helperLabel({}, this);
     form->addRow(flowHelp);
 
     auto* error = errorLabel(this);
     layout->addWidget(error);
-    layout->addStretch();
+    if (editing)
+        layout->addStretch();
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
     auto* save = buttons->button(QDialogButtonBox::Ok);
     save->setText(editing ? tr("Сохранить") : tr("Добавить"));
@@ -449,90 +647,123 @@ ClientDialog::ClientDialog(const QList<ServerConfig>& servers,
     layout->addWidget(buttons);
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
 
-    const auto updateFlow = [=] {
-        const bool vless =
-            !editing && inbound->currentData(protocolRole).toString() == QStringLiteral("vless");
-        if (!vless) {
-            const QSignalBlocker blocker(flow);
-            flow->setCurrentIndex(0);
-        }
-        setFieldVisible(form, flow, vless);
-        flowHelp->setVisible(vless);
-        flow->setEnabled(vless);
-    };
-
     if (editing) {
-        const Inventory inventory = inventories.value(existing->serverId);
-        QStringList titles;
-        for (int id : existing->inboundIds) {
-            QString title = tr("Inbound №%1").arg(id);
-            for (const auto& item : inventory.inbounds) {
-                if (item.id == id) {
-                    title = inboundTitle(item);
-                    break;
-                }
-            }
-            titles.append(title);
-        }
-        inbound->addItem(titles.isEmpty() ? tr("Inbound недоступен")
-                                          : titles.join(QStringLiteral("; ")),
-                         existing->inboundIds.isEmpty() ? 0 : existing->inboundIds.first());
-        inbound->setEnabled(false);
-        inboundHelp->setText(
-            existing->inboundIds.size() > 1
-                ? tr("Изменения применятся к клиенту на всех его inbound на этом сервере.")
-                : tr("Сервер, inbound и имя клиента сохраняются."));
-        updateFlow();
+        setFieldVisible(form, flow, false);
+        flowHelp->hide();
+        flow->setEnabled(false);
     } else {
-        const auto populateInbounds = [=] {
-            const QSignalBlocker blocker(inbound);
-            inbound->clear();
-            const auto inventory = inventories.constFind(server->currentData().toString());
-            if (inventory != inventories.constEnd()) {
-                for (const auto& item : inventory->inbounds) {
-                    if (!item.enable || item.id <= 0 || !supportedProtocol(item.protocol))
-                        continue;
-                    inbound->addItem(inboundTitle(item), item.id);
-                    inbound->setItemData(inbound->count() - 1, item.protocol.toLower(),
-                                         protocolRole);
+        const auto updateSelection = [=] {
+            {
+                const QSignalBlocker blocker(targetTree);
+                for (int i = 0; i < targetTree->topLevelItemCount(); ++i) {
+                    auto* server = targetTree->topLevelItem(i);
+                    int available = 0;
+                    int checked = 0;
+                    for (int j = 0; j < server->childCount(); ++j) {
+                        const auto* child = server->child(j);
+                        if (!child->data(0, availableRole).toBool())
+                            continue;
+                        ++available;
+                        if (child->checkState(0) == Qt::Checked)
+                            ++checked;
+                    }
+                    if (server->flags() & Qt::ItemIsUserCheckable)
+                        server->setCheckState(
+                            0, checked == 0
+                                   ? Qt::Unchecked
+                                   : (checked == available ? Qt::Checked : Qt::PartiallyChecked));
                 }
             }
-            const bool available = inbound->count() > 0;
-            if (!available)
-                inbound->addItem(tr("Нет доступных inbound"));
-            inbound->setEnabled(available);
-            save->setEnabled(available && !server->currentData().toString().isEmpty());
-            inboundHelp->setText(
-                available
-                    ? tr("Показаны только включённые VLESS, VMess и Trojan inbound.")
-                    : tr("Обновите список сервера или включите совместимый inbound в панели."));
-            updateFlow();
+            const auto selection = selectedTargets(targetTree);
+            selectionCount->setText(tr("Выбрано серверов: %1 · inbound: %2")
+                                        .arg(selection.targets.size())
+                                        .arg(selection.inboundCount));
+            bool masterSelected = false;
+            for (const auto& target : selection.targets)
+                masterSelected = masterSelected || target.serverId == masterServerId;
+            masterLink->setText(
+                masterName.isEmpty()
+                    ? tr("Общая ссылка подписки требует мастер-сервера и клиента с общим subId на "
+                         "нём.")
+                    : (masterSelected
+                           ? tr("Общая ссылка использует мастер-сервер «%1» и общий subId. "
+                                "Его inbound можно снять с выбора.")
+                                 .arg(masterName)
+                           : tr("Для общей ссылки на мастер-сервере «%1» должен существовать "
+                                "клиент "
+                                "с общим subId. Сейчас его inbound не выбраны.")
+                                 .arg(masterName)));
+            if (!selection.allVless) {
+                const QSignalBlocker blocker(flow);
+                flow->setCurrentIndex(0);
+            }
+            flow->setEnabled(selection.allVless);
+            flowHelp->setText(
+                selection.allVless
+                    ? tr("Vision должен поддерживаться настройками всех выбранных inbound.")
+                    : tr("Vision доступен, только если все выбранные inbound используют VLESS."));
         };
-        connect(server, &QComboBox::currentIndexChanged, this,
-                [populateInbounds](int) { populateInbounds(); });
-        connect(inbound, &QComboBox::currentIndexChanged, this,
-                [updateFlow](int) { updateFlow(); });
-        populateInbounds();
+        connect(
+            targetTree, &QTreeWidget::itemChanged, this, [=](QTreeWidgetItem* item, int column) {
+                if (column != 0)
+                    return;
+                if (!item->parent() && item->checkState(0) != Qt::PartiallyChecked) {
+                    const QSignalBlocker blocker(targetTree);
+                    const bool checked = item->checkState(0) == Qt::Checked;
+                    for (int j = 0; j < item->childCount(); ++j) {
+                        auto* child = item->child(j);
+                        child->setCheckState(0, checked && child->data(0, availableRole).toBool()
+                                                    ? Qt::Checked
+                                                    : Qt::Unchecked);
+                    }
+                }
+                updateSelection();
+            });
+        const auto setAllTargets = [=](bool checked) {
+            {
+                const QSignalBlocker blocker(targetTree);
+                for (int i = 0; i < targetTree->topLevelItemCount(); ++i) {
+                    auto* server = targetTree->topLevelItem(i);
+                    for (int j = 0; j < server->childCount(); ++j) {
+                        auto* child = server->child(j);
+                        child->setCheckState(0, checked && child->data(0, availableRole).toBool()
+                                                    ? Qt::Checked
+                                                    : Qt::Unchecked);
+                    }
+                }
+            }
+            updateSelection();
+        };
+        connect(selectAll, &QPushButton::clicked, this, [setAllTargets] { setAllTargets(true); });
+        connect(clearSelection, &QPushButton::clicked, this,
+                [setAllTargets] { setAllTargets(false); });
+        updateSelection();
     }
 
     connect(buttons, &QDialogButtonBox::accepted, this, [=] {
         quota->interpretText();
         if (!editing || *expiryEdited || (relativeExpiry && overrideRelativeExpiry->isChecked()))
             expiry->interpretText();
-        const QString chosenServer =
-            editing ? existing->serverId : server->currentData().toString();
-        const int chosenInbound =
-            editing ? (existing->inboundIds.isEmpty() ? 0 : existing->inboundIds.first())
-                    : inbound->currentData().toInt();
+        const TargetSelection selection = editing ? TargetSelection{} : selectedTargets(targetTree);
+        const QList<ClientTarget> chosenTargets =
+            editing ? QList<ClientTarget>{{existing->serverId, existing->inboundIds}}
+                    : selection.targets;
         const QString chosenEmail = editing ? existing->email : email->text().trimmed();
-        if (!editing && (chosenServer.isEmpty() || chosenInbound <= 0 ||
-                         !supportedProtocol(inbound->currentData(protocolRole).toString()))) {
-            reportError(error, tr("Выберите сервер и активный совместимый inbound."), inbound);
+        if (!editing && selection.invalid) {
+            reportError(error,
+                        tr("Выбран недоступный, выключенный или неподдерживаемый inbound. "
+                           "Снимите его выбор."),
+                        targetTree);
+            return;
+        }
+        if (!editing && chosenTargets.isEmpty()) {
+            reportError(error, tr("Выберите хотя бы один активный совместимый inbound."),
+                        targetTree);
             return;
         }
         if (!editing && !validEmail(chosenEmail)) {
             reportError(error,
-                        tr("Введите имя длиной до 128 символов без /, ?, # "
+                        tr("Введите имя длиной до 128 символов без пробелов, \\, /, ?, # "
                            "и управляющих символов."),
                         email);
             return;
@@ -550,17 +781,15 @@ ClientDialog::ClientDialog(const QList<ServerConfig>& servers,
             return;
         }
         const qint64 desiredQuota = qRound64(quota->value() * bytesPerGb);
-        serverId_ = chosenServer;
-        draft_.inboundId = chosenInbound;
+        targets_ = chosenTargets;
+        serverId_ = targets_.first().serverId;
+        draft_.inboundIds = targets_.first().inboundIds;
         draft_.email = chosenEmail;
         draft_.totalBytes = editing && !*quotaEdited ? existing->totalBytes : desiredQuota;
         draft_.expiryTime = editing && !changeExpiry ? existing->expiryTime : desiredExpiry;
         draft_.enable = enabled->isChecked();
-        draft_.flow =
-            editing ? existing->raw.value(QStringLiteral("flow")).toString()
-                    : (inbound->currentData(protocolRole).toString() == QStringLiteral("vless")
-                           ? flow->currentData().toString()
-                           : QString());
+        draft_.flow = editing ? existing->raw.value(QStringLiteral("flow")).toString()
+                              : (selection.allVless ? flow->currentData().toString() : QString());
         patch_ = {};
         if (editing) {
             if (*quotaEdited && desiredQuota != existing->totalBytes)
@@ -588,5 +817,9 @@ ClientDraft ClientDialog::draft() const {
 
 ClientPatch ClientDialog::patch() const {
     return patch_;
+}
+
+QList<ClientTarget> ClientDialog::targets() const {
+    return targets_;
 }
 } // namespace fleet

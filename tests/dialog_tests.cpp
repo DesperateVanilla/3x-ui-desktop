@@ -10,9 +10,11 @@
 #include <QLineEdit>
 #include <QLocale>
 #include <QPushButton>
+#include <QScrollArea>
 #include <QSignalSpy>
 #include <QTest>
 #include <QTimeZone>
+#include <QTreeWidget>
 #include <limits>
 
 using namespace fleet;
@@ -48,6 +50,29 @@ QHash<QString, Inventory> inventories() {
     return {{QStringLiteral("server-one"), inventory}};
 }
 
+QList<ServerConfig> multipleServers() {
+    auto second = serverConfig();
+    second.id = QStringLiteral("server-two");
+    second.name = QStringLiteral("Second server");
+    auto missing = serverConfig();
+    missing.id = QStringLiteral("server-three");
+    missing.name = QStringLiteral("Unloaded server");
+    return {serverConfig(), second, missing};
+}
+
+QHash<QString, Inventory> multipleInventories() {
+    auto result = inventories();
+    Inventory second;
+    second.inbounds = {{QStringLiteral("server-two"), 11, QStringLiteral("Second VLESS"),
+                        QStringLiteral("vless"), 443, true},
+                       {QStringLiteral("server-two"), 12, QStringLiteral("Another VLESS"),
+                        QStringLiteral("vless"), 8443, true},
+                       {QStringLiteral("server-two"), 13, QStringLiteral("Disabled VMess"),
+                        QStringLiteral("vmess"), 9443, false}};
+    result.insert(QStringLiteral("server-two"), second);
+    return result;
+}
+
 Client client(qint64 totalBytes, qint64 expiryTime) {
     Client result;
     result.serverId = QStringLiteral("server-one");
@@ -66,6 +91,34 @@ template <class T> T* field(QObject& dialog, const char* name) {
     if (!result)
         qFatal("Missing dialog control: %s", name);
     return result;
+}
+
+QTreeWidgetItem* serverNode(ClientDialog& dialog, const QString& serverId) {
+    auto* tree = field<QTreeWidget>(dialog, "targetTree");
+    for (int i = 0; i < tree->topLevelItemCount(); ++i) {
+        auto* item = tree->topLevelItem(i);
+        if (item->data(0, Qt::UserRole).toString() == serverId)
+            return item;
+    }
+    qFatal("Missing target server: %s", qPrintable(serverId));
+    return nullptr;
+}
+
+QTreeWidgetItem* inboundNode(ClientDialog& dialog, const QString& serverId, int inboundId) {
+    auto* server = serverNode(dialog, serverId);
+    for (int i = 0; i < server->childCount(); ++i) {
+        auto* item = server->child(i);
+        if (item->data(0, Qt::UserRole + 1).toInt() == inboundId)
+            return item;
+    }
+    qFatal("Missing target inbound: %d", inboundId);
+    return nullptr;
+}
+
+void selectTarget(ClientDialog& dialog, const QString& serverId, int inboundId,
+                  bool selected = true) {
+    inboundNode(dialog, serverId, inboundId)
+        ->setCheckState(0, selected ? Qt::Checked : Qt::Unchecked);
 }
 
 QPushButton* saveButton(QDialog& dialog) {
@@ -307,6 +360,10 @@ class DialogTests : public QObject {
         QTest::newRow("slash") << QStringLiteral("bad/name");
         QTest::newRow("query") << QStringLiteral("bad?name");
         QTest::newRow("fragment") << QStringLiteral("bad#name");
+        QTest::newRow("backslash") << QStringLiteral("bad\\name");
+        QTest::newRow("space") << QStringLiteral("bad name");
+        QTest::newRow("unicode-space")
+            << (QStringLiteral("bad") + QChar(0x00a0) + QStringLiteral("name"));
         QTest::newRow("control") << (QStringLiteral("bad") + QChar(1) + QStringLiteral("name"));
     }
 
@@ -314,6 +371,7 @@ class DialogTests : public QObject {
         QFETCH(QString, email);
         ClientDialog dialog({serverConfig()}, inventories());
         QSignalSpy accepted(&dialog, &QDialog::accepted);
+        selectTarget(dialog, QStringLiteral("server-one"), 1);
         field<QLineEdit>(dialog, "email")->setText(email);
         show(dialog);
         saveButton(dialog)->click();
@@ -329,23 +387,236 @@ class DialogTests : public QObject {
     void supportedInboundsAndFlowFollowSelection() {
         ClientDialog dialog({serverConfig()}, inventories());
         show(dialog);
-        auto* inbound = field<QComboBox>(dialog, "inbound");
+        auto* server = serverNode(dialog, QStringLiteral("server-one"));
         auto* flow = field<QComboBox>(dialog, "flow");
-        QCOMPARE(inbound->count(), 3);
-        QVERIFY(inbound->findData(4) < 0);
-        QVERIFY(inbound->findData(5) < 0);
+        QCOMPARE(server->childCount(), 5);
+        auto* disabled = inboundNode(dialog, QStringLiteral("server-one"), 4);
+        auto* unsupported = inboundNode(dialog, QStringLiteral("server-one"), 5);
+        QVERIFY(!(disabled->flags() & Qt::ItemIsEnabled));
+        QVERIFY(!(unsupported->flags() & Qt::ItemIsEnabled));
+        QVERIFY(!disabled->text(1).isEmpty());
+        QVERIFY(!unsupported->text(1).isEmpty());
+        selectTarget(dialog, QStringLiteral("server-one"), 1);
         QVERIFY(flow->isVisible());
+        QVERIFY(flow->isEnabled());
         flow->setCurrentIndex(1);
         QCOMPARE(flow->currentData().toString(), QStringLiteral("xtls-rprx-vision"));
-        inbound->setCurrentIndex(inbound->findData(2));
-        QVERIFY(!flow->isVisible());
+        selectTarget(dialog, QStringLiteral("server-one"), 2);
+        QVERIFY(!flow->isEnabled());
         QCOMPARE(flow->currentIndex(), 0);
         field<QLineEdit>(dialog, "email")->setText(QString(129, QLatin1Char('x')));
         QCOMPARE(field<QLineEdit>(dialog, "email")->text().size(), qsizetype(128));
         saveButton(dialog)->click();
-        QCOMPARE(dialog.draft().inboundId, 2);
+        QCOMPARE(dialog.draft().inboundIds, QList<int>({1, 2}));
         QVERIFY(dialog.draft().flow.isEmpty());
         QCOMPARE(dialog.draft().email.size(), qsizetype(128));
+    }
+
+    void selectAllGroupsTargetsAcrossServers() {
+        ClientDialog dialog(multipleServers(), multipleInventories());
+        QSignalSpy accepted(&dialog, &QDialog::accepted);
+        show(dialog);
+        field<QPushButton>(dialog, "selectAllTargets")->click();
+        const auto* count = field<QLabel>(dialog, "selectionCount");
+        QVERIFY(count->text().contains(QStringLiteral("серверов: 2")));
+        QVERIFY(count->text().contains(QStringLiteral("inbound: 5")));
+        QCOMPARE(serverNode(dialog, QStringLiteral("server-one"))->checkState(0), Qt::Checked);
+        QCOMPARE(serverNode(dialog, QStringLiteral("server-two"))->checkState(0), Qt::Checked);
+        QCOMPARE(inboundNode(dialog, QStringLiteral("server-one"), 4)->checkState(0),
+                 Qt::Unchecked);
+        QCOMPARE(inboundNode(dialog, QStringLiteral("server-one"), 5)->checkState(0),
+                 Qt::Unchecked);
+        auto* missing = serverNode(dialog, QStringLiteral("server-three"));
+        QVERIFY(!(missing->flags() & Qt::ItemIsEnabled));
+        QVERIFY(!missing->text(1).isEmpty());
+        field<QLineEdit>(dialog, "email")->setText(QStringLiteral("common-phone"));
+        saveButton(dialog)->click();
+        QCOMPARE(accepted.count(), 1);
+        const auto targets = dialog.targets();
+        QCOMPARE(targets.size(), qsizetype(2));
+        QCOMPARE(targets[0].serverId, QStringLiteral("server-one"));
+        QCOMPARE(targets[0].inboundIds, QList<int>({1, 2, 3}));
+        QCOMPARE(targets[1].serverId, QStringLiteral("server-two"));
+        QCOMPARE(targets[1].inboundIds, QList<int>({11, 12}));
+        QCOMPARE(dialog.selectedServerId(), targets.first().serverId);
+        QCOMPARE(dialog.draft().inboundIds, targets.first().inboundIds);
+        QVERIFY(dialog.draft().clientId.isEmpty());
+        QVERIFY(dialog.draft().password.isEmpty());
+        QVERIFY(dialog.draft().subId.isEmpty());
+    }
+
+    void longUnicodeEmailRemainsSupportedAndFooterOutsideScroll() {
+        ClientDialog dialog(multipleServers(), multipleInventories());
+        QSignalSpy accepted(&dialog, &QDialog::accepted);
+        show(dialog);
+        auto* scroll = field<QScrollArea>(dialog, "clientFormScroll");
+        QVERIFY(scroll->widgetResizable());
+        QVERIFY(!scroll->isAncestorOf(saveButton(dialog)));
+        selectTarget(dialog, QStringLiteral("server-one"), 1);
+        const QString unicodeEmail(128, QChar(0x044f));
+        field<QLineEdit>(dialog, "email")->setText(unicodeEmail);
+        saveButton(dialog)->click();
+        QCOMPARE(accepted.count(), 1);
+        QCOMPARE(dialog.draft().email, unicodeEmail);
+    }
+
+    void deselectionUpdatesParentsAndClearRemovesAllTargets() {
+        ClientDialog dialog(multipleServers(), multipleInventories());
+        QSignalSpy accepted(&dialog, &QDialog::accepted);
+        show(dialog);
+        field<QPushButton>(dialog, "selectAllTargets")->click();
+        selectTarget(dialog, QStringLiteral("server-one"), 1, false);
+        QCOMPARE(serverNode(dialog, QStringLiteral("server-one"))->checkState(0),
+                 Qt::PartiallyChecked);
+        serverNode(dialog, QStringLiteral("server-two"))->setCheckState(0, Qt::Unchecked);
+        QCOMPARE(inboundNode(dialog, QStringLiteral("server-two"), 11)->checkState(0),
+                 Qt::Unchecked);
+        QVERIFY(
+            field<QLabel>(dialog, "selectionCount")->text().contains(QStringLiteral("inbound: 2")));
+        field<QPushButton>(dialog, "clearTargets")->click();
+        QCOMPARE(serverNode(dialog, QStringLiteral("server-one"))->checkState(0), Qt::Unchecked);
+        QVERIFY(
+            field<QLabel>(dialog, "selectionCount")->text().contains(QStringLiteral("inbound: 0")));
+        field<QLineEdit>(dialog, "email")->setText(QStringLiteral("common-phone"));
+        saveButton(dialog)->click();
+        QCOMPARE(accepted.count(), 0);
+        QVERIFY(dialog.isVisible());
+        QVERIFY(field<QLabel>(dialog, "validationError")->isVisible());
+    }
+
+    void serverCheckboxSelectsOnlySupportedEnabledChildren() {
+        ClientDialog dialog(multipleServers(), multipleInventories());
+        show(dialog);
+        serverNode(dialog, QStringLiteral("server-one"))->setCheckState(0, Qt::Checked);
+        QCOMPARE(inboundNode(dialog, QStringLiteral("server-one"), 1)->checkState(0), Qt::Checked);
+        QCOMPARE(inboundNode(dialog, QStringLiteral("server-one"), 2)->checkState(0), Qt::Checked);
+        QCOMPARE(inboundNode(dialog, QStringLiteral("server-one"), 3)->checkState(0), Qt::Checked);
+        QCOMPARE(inboundNode(dialog, QStringLiteral("server-one"), 4)->checkState(0),
+                 Qt::Unchecked);
+        QCOMPARE(inboundNode(dialog, QStringLiteral("server-one"), 5)->checkState(0),
+                 Qt::Unchecked);
+        field<QLineEdit>(dialog, "email")->setText(QStringLiteral("common-phone"));
+        saveButton(dialog)->click();
+        QCOMPARE(dialog.targets().size(), qsizetype(1));
+        QCOMPARE(dialog.targets().first().inboundIds, QList<int>({1, 2, 3}));
+    }
+
+    void unsupportedCheckedTargetCannotBeAccepted() {
+        ClientDialog dialog(multipleServers(), multipleInventories());
+        QSignalSpy accepted(&dialog, &QDialog::accepted);
+        show(dialog);
+        selectTarget(dialog, QStringLiteral("server-one"), 1);
+        // Programmatic check exercises validation even though this row is disabled in the UI.
+        selectTarget(dialog, QStringLiteral("server-one"), 5);
+        field<QLineEdit>(dialog, "email")->setText(QStringLiteral("common-phone"));
+        saveButton(dialog)->click();
+        QCOMPARE(accepted.count(), 0);
+        QVERIFY(dialog.isVisible());
+        QVERIFY(field<QLabel>(dialog, "validationError")->isVisible());
+        field<QPushButton>(dialog, "clearTargets")->click();
+        selectTarget(dialog, QStringLiteral("server-two"), 11);
+        saveButton(dialog)->click();
+        QCOMPARE(accepted.count(), 1);
+        QCOMPARE(dialog.targets().first().serverId, QStringLiteral("server-two"));
+        QCOMPARE(dialog.targets().first().inboundIds, QList<int>({11}));
+    }
+
+    void visionCanSpanServersButMixedSelectionClearsIt() {
+        ClientDialog dialog(multipleServers(), multipleInventories());
+        show(dialog);
+        selectTarget(dialog, QStringLiteral("server-one"), 1);
+        selectTarget(dialog, QStringLiteral("server-two"), 11);
+        auto* flow = field<QComboBox>(dialog, "flow");
+        QVERIFY(flow->isEnabled());
+        flow->setCurrentIndex(1);
+        selectTarget(dialog, QStringLiteral("server-one"), 3);
+        QVERIFY(!flow->isEnabled());
+        QCOMPARE(flow->currentIndex(), 0);
+        // A stale flow value must also be ignored at accept time for a mixed set.
+        flow->setCurrentIndex(1);
+        field<QLineEdit>(dialog, "email")->setText(QStringLiteral("common-phone"));
+        saveButton(dialog)->click();
+        QCOMPARE(dialog.targets().size(), qsizetype(2));
+        QVERIFY(dialog.draft().flow.isEmpty());
+    }
+
+    void masterDefaultSelection_data() {
+        QTest::addColumn<QString>("masterId");
+        QTest::addColumn<QString>("expectedServer");
+        QTest::addColumn<QList<int>>("expectedInbounds");
+        QTest::newRow("first-loaded-master")
+            << QStringLiteral("server-one") << QStringLiteral("server-one")
+            << QList<int>({1, 2, 3});
+        QTest::newRow("second-loaded-master")
+            << QStringLiteral("server-two") << QStringLiteral("server-two") << QList<int>({11, 12});
+        QTest::newRow("unloaded-master")
+            << QStringLiteral("server-three") << QString() << QList<int>();
+        QTest::newRow("unknown-master") << QStringLiteral("unknown") << QString() << QList<int>();
+        QTest::newRow("no-master") << QString() << QString() << QList<int>();
+    }
+
+    void masterDefaultSelection() {
+        QFETCH(QString, masterId);
+        QFETCH(QString, expectedServer);
+        QFETCH(QList<int>, expectedInbounds);
+        ClientDialog dialog(multipleServers(), multipleInventories(), {}, nullptr, masterId);
+        QSignalSpy accepted(&dialog, &QDialog::accepted);
+        show(dialog);
+        field<QLineEdit>(dialog, "email")->setText(QStringLiteral("common-phone"));
+        const auto* shared = field<QLabel>(dialog, "sharedIdentifiers");
+        QVERIFY(shared->text().contains(QStringLiteral("UUID")));
+        QVERIFY(shared->text().contains(QStringLiteral("subId")));
+        QVERIFY(!field<QLabel>(dialog, "masterSubscriptionHelp")->text().isEmpty());
+        saveButton(dialog)->click();
+        if (expectedInbounds.isEmpty()) {
+            QCOMPARE(accepted.count(), 0);
+            QVERIFY(dialog.isVisible());
+        } else {
+            QCOMPARE(accepted.count(), 1);
+            QCOMPARE(dialog.targets().size(), qsizetype(1));
+            QCOMPARE(dialog.targets().first().serverId, expectedServer);
+            QCOMPARE(dialog.targets().first().inboundIds, expectedInbounds);
+        }
+    }
+
+    void masterCanBeDeselected() {
+        ClientDialog dialog(multipleServers(), multipleInventories(), {}, nullptr,
+                            QStringLiteral("server-one"));
+        show(dialog);
+        field<QPushButton>(dialog, "clearTargets")->click();
+        selectTarget(dialog, QStringLiteral("server-two"), 11);
+        auto* flow = field<QComboBox>(dialog, "flow");
+        QVERIFY(flow->isEnabled());
+        flow->setCurrentIndex(1);
+        field<QLineEdit>(dialog, "email")->setText(QStringLiteral("common-phone"));
+        saveButton(dialog)->click();
+        QCOMPARE(dialog.targets().size(), qsizetype(1));
+        QCOMPARE(dialog.targets().first().serverId, QStringLiteral("server-two"));
+        QCOMPARE(dialog.draft().flow, QStringLiteral("xtls-rprx-vision"));
+    }
+
+    void editPreservesAllBindingsWithDifferentMaster() {
+        auto original = client(17 * gb + 123, -30LL * 86400000LL);
+        original.inboundIds = {1, 2, 99};
+        ClientDialog dialog(multipleServers(), multipleInventories(), original, nullptr,
+                            QStringLiteral("server-two"));
+        QSignalSpy accepted(&dialog, &QDialog::accepted);
+        show(dialog);
+        QVERIFY(!dialog.findChild<QTreeWidget*>(QStringLiteral("targetTree")));
+        QVERIFY(!field<QComboBox>(dialog, "server")->isEnabled());
+        QVERIFY(!field<QComboBox>(dialog, "inbound")->isEnabled());
+        QVERIFY(field<QLineEdit>(dialog, "email")->isReadOnly());
+        saveButton(dialog)->click();
+        QCOMPARE(accepted.count(), 1);
+        QCOMPARE(dialog.targets().size(), qsizetype(1));
+        QCOMPARE(dialog.targets().first().serverId, original.serverId);
+        QCOMPARE(dialog.targets().first().inboundIds, original.inboundIds);
+        QCOMPARE(dialog.draft().inboundIds, original.inboundIds);
+        QCOMPARE(dialog.draft().totalBytes, original.totalBytes);
+        QCOMPARE(dialog.draft().expiryTime, original.expiryTime);
+        QVERIFY(!dialog.patch().totalBytes.has_value());
+        QVERIFY(!dialog.patch().expiryTime.has_value());
+        QVERIFY(!dialog.patch().enable.has_value());
     }
 };
 

@@ -19,6 +19,8 @@ class ThreeXUiApi : public QObject {
     void deleteClient(const Client& client, Callback<bool> callback);
     void resetClientTraffic(const Client& client, Callback<bool> callback);
     void serverAction(ServerAction action, const QString& version, Callback<bool> callback);
+    void downloadDatabase(Callback<QByteArray> callback);
+    void restoreDatabase(const QByteArray& data, bool keepHostSettings, Callback<bool> callback);
     static Outcome<QUrl> validatePanelUrl(const ServerConfig& config);
     static Outcome<Snapshot> parseStatus(const QJsonObject& object, const QString& serverId);
     static Outcome<Inventory> parseInventory(const QJsonArray& inbounds,
@@ -48,5 +50,10 @@ class ThreeXUiApi : public QObject {
     void prepare(Callback<bool> callback);
     void mutate(const Client& client, const ClientPatch& patch, Mutation mutation,
                 Callback<bool> callback);
+    void binaryRequest(const QString& path, const QByteArray& upload, const QByteArray& contentType,
+                       Callback<QByteArray> callback, qint64 limit, int timeoutMs, bool mutation);
+    void createModern(const ClientDraft& draft, Callback<bool> callback);
+    void verifyCreated(const ClientDraft& draft, bool mayDisable, const QString& partialError,
+                       Callback<bool> callback, bool vmess = false);
 };
 } // namespace fleet

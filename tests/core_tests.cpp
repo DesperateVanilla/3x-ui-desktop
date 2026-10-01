@@ -1,11 +1,16 @@
+#include "backup_file.h"
 #include "three_x_ui_api.h"
 
+#include <QFile>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QMap>
 #include <QPointer>
+#include <QSqlDatabase>
+#include <QSqlQuery>
 #include <QTcpServer>
 #include <QTcpSocket>
+#include <QTemporaryDir>
 #include <QTest>
 #include <QUrlQuery>
 #include <QUuid>
@@ -30,6 +35,7 @@ class MockPanel : public QObject {
         int status;
         QByteArray body;
         QMap<QByteArray, QByteArray> headers;
+        std::function<QByteArray(const Request&)> bodyFactory;
     };
     QTcpServer server;
     QList<Request> requests;
@@ -72,18 +78,28 @@ class MockPanel : public QObject {
                     request.body = buffer->mid(headerEnd + 4, length);
                     requests.append(request);
                     *handled = true;
-                    const Response response = responses.isEmpty()
-                                                  ? Response{500, QByteArray("{}"), {}}
-                                                  : responses.takeFirst();
+                    Response response = responses.isEmpty() ? Response{500, QByteArray("{}"), {}}
+                                                            : responses.takeFirst();
                     if (response.status == 0)
                         return; // Deliberately unanswered request.
-                    QByteArray message = "HTTP/1.1 " + QByteArray::number(response.status) +
-                                         " Test\r\nContent-Type: application/json\r\nConnection: "
-                                         "close\r\nContent-Length: " +
-                                         QByteArray::number(response.body.size()) + "\r\n";
+                    if (response.status < 0) {
+                        socket->disconnectFromHost();
+                        return;
+                    }
+                    if (response.bodyFactory)
+                        response.body = response.bodyFactory(request);
+                    QByteArray message =
+                        "HTTP/1.1 " + QByteArray::number(response.status) +
+                        " Test\r\nConnection: close\r\nContent-Length: " +
+                        response.headers.value("Content-Length",
+                                               QByteArray::number(response.body.size())) +
+                        "\r\n";
+                    message += "Content-Type: " +
+                               response.headers.value("Content-Type", "application/json") + "\r\n";
                     for (auto it = response.headers.constBegin(); it != response.headers.constEnd();
                          ++it)
-                        message += it.key() + ": " + it.value() + "\r\n";
+                        if (it.key() != "Content-Length" && it.key() != "Content-Type")
+                            message += it.key() + ": " + it.value() + "\r\n";
                     message += "\r\n";
                     message += response.body;
                     socket->write(message);
@@ -98,6 +114,34 @@ class MockPanel : public QObject {
             {status, QJsonDocument(value).toJson(QJsonDocument::Compact), std::move(headers)});
     }
     void hold() { responses.append({0, {}, {}}); }
+    void reflectCreatedClient(bool enabled) {
+        responses.append(
+            {200, {}, {}, [this, enabled](const Request&) {
+                 QJsonObject created;
+                 QJsonObject record;
+                 for (const auto& previous : requests) {
+                     if (previous.method != "POST")
+                         continue;
+                     const auto body = QJsonDocument::fromJson(previous.body).object();
+                     if (previous.target.endsWith("/clients/add")) {
+                         created = body;
+                         record = body.value(QStringLiteral("client")).toObject();
+                     } else if (previous.target.contains("/clients/update/"))
+                         record = body;
+                 }
+                 const QString uuid = record.value(QStringLiteral("id")).toString();
+                 record.insert(QStringLiteral("uuid"), uuid);
+                 record.insert(QStringLiteral("id"), 42);
+                 record.insert(QStringLiteral("enable"), enabled);
+                 record.insert(QStringLiteral("inboundIds"),
+                               created.value(QStringLiteral("inboundIds")));
+                 return QJsonDocument(
+                            envelope(QJsonObject{{QStringLiteral("client"), record},
+                                                 {QStringLiteral("inboundIds"),
+                                                  created.value(QStringLiteral("inboundIds"))}}))
+                     .toJson(QJsonDocument::Compact);
+             }});
+    }
     QUrl url() const {
         return QUrl(QStringLiteral("http://127.0.0.1:%1/secret/base/").arg(server.serverPort()));
     }
@@ -193,6 +237,49 @@ QJsonObject formClient(const QByteArray& body) {
         .toArray()
         .first()
         .toObject();
+}
+
+ClientDraft sharedDraft() {
+    const auto raw = modernRecord();
+    ClientDraft draft;
+    draft.inboundIds = {1, 2};
+    draft.email = raw.value(QStringLiteral("email")).toString();
+    draft.clientId = raw.value(QStringLiteral("uuid")).toString();
+    draft.password = raw.value(QStringLiteral("password")).toString();
+    draft.subId = raw.value(QStringLiteral("subId")).toString();
+    draft.totalBytes = raw.value(QStringLiteral("totalGB")).toInteger();
+    draft.expiryTime = raw.value(QStringLiteral("expiryTime")).toInteger();
+    draft.enable = true;
+    draft.flow = raw.value(QStringLiteral("flow")).toString();
+    return draft;
+}
+
+QByteArray sqliteFixture() {
+    QTemporaryDir directory;
+    const QString path = directory.filePath(QStringLiteral("panel.db"));
+    const QString connection = QStringLiteral("backup-fixture-") + QUuid::createUuid().toString();
+    {
+        auto database = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connection);
+        database.setDatabaseName(path);
+        if (!database.open())
+            qFatal("Cannot create SQLite backup fixture");
+        QSqlQuery query(database);
+        if (!query.exec(QStringLiteral(
+                "CREATE TABLE inbounds (id INTEGER PRIMARY KEY, protocol TEXT, settings TEXT)")) ||
+            !query.exec(
+                QStringLiteral("CREATE TABLE clients (id INTEGER PRIMARY KEY, email TEXT)")) ||
+            !query.exec(QStringLiteral(
+                "CREATE TABLE settings (id INTEGER PRIMARY KEY, key TEXT, value TEXT)")) ||
+            !query.exec(QStringLiteral(
+                "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, password TEXT)")))
+            qFatal("Cannot initialize SQLite backup fixture");
+        database.close();
+    }
+    QSqlDatabase::removeDatabase(connection);
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly))
+        qFatal("Cannot read SQLite backup fixture");
+    return file.readAll();
 }
 } // namespace
 
@@ -588,7 +675,7 @@ class CoreTests : public QObject {
         mock.add(200, envelope(QJsonArray{legacyInbound()}));
         mock.add(200, envelope());
         ClientDraft draft;
-        draft.inboundId = 1;
+        draft.inboundIds = {1};
         draft.email = QStringLiteral("new+client@example.com");
         draft.totalBytes = 1234;
         draft.flow = QStringLiteral("xtls-rprx-vision");
@@ -820,7 +907,7 @@ class CoreTests : public QObject {
         ThreeXUiApi api(configuration(mock));
         mock.add(200, envelope(QJsonArray{inbound(1, QStringLiteral("shadowsocks"))}));
         ClientDraft draft;
-        draft.inboundId = 1;
+        draft.inboundIds = {1};
         draft.email = QStringLiteral("new-client");
         bool done = false;
         Outcome<bool> result;
@@ -856,9 +943,13 @@ class CoreTests : public QObject {
         MockPanel mock;
         ThreeXUiApi api(configuration(mock));
         mock.add(200, envelope(QJsonArray{inbound(3, protocol)}));
+        mock.add(200, envelope(QJsonArray{}));
         mock.add(200, envelope());
+        mock.reflectCreatedClient(true);
+        mock.add(200, envelope());
+        mock.reflectCreatedClient(false);
         ClientDraft draft;
-        draft.inboundId = 3;
+        draft.inboundIds = {3};
         draft.email = QStringLiteral("created+client@example.com");
         draft.totalBytes = qint64(9 * 1024 * 1024 * 1024LL);
         draft.expiryTime = -86400000;
@@ -873,8 +964,8 @@ class CoreTests : public QObject {
         });
         QTRY_VERIFY_WITH_TIMEOUT(done, 3000);
         QVERIFY2(result.ok, qPrintable(result.error));
-        QCOMPARE(mock.requests.size(), 2);
-        const auto& request = mock.requests.last();
+        QCOMPARE(mock.requests.size(), 6);
+        const auto& request = mock.requests.at(2);
         QCOMPARE(request.method, QByteArray("POST"));
         QCOMPARE(request.target, QByteArray("/secret/base/panel/api/clients/add"));
         QCOMPARE(request.headers.value("authorization"), QByteArray("Bearer test-token"));
@@ -896,6 +987,455 @@ class CoreTests : public QObject {
             QCOMPARE(client.value(QStringLiteral("security")).toString(), QStringLiteral("auto"));
         QCOMPARE(client.value(QStringLiteral("limitIp")).toInt(), 0);
         QCOMPARE(client.value(QStringLiteral("limitHwid")).toInt(), 0);
+    }
+
+    void modernOrphanBindingsAreValidAndMalformedBindingsFail_data() {
+        QTest::addColumn<QJsonValue>("bindings");
+        QTest::addColumn<bool>("valid");
+        QTest::newRow("missing") << QJsonValue(QJsonValue::Undefined) << true;
+        QTest::newRow("null") << QJsonValue(QJsonValue::Null) << true;
+        QTest::newRow("empty") << QJsonValue(QJsonArray{}) << true;
+        QTest::newRow("string") << QJsonValue(QStringLiteral("1")) << false;
+        QTest::newRow("null-entry") << QJsonValue(QJsonArray{QJsonValue::Null}) << false;
+        QTest::newRow("zero") << QJsonValue(QJsonArray{0}) << false;
+        QTest::newRow("negative") << QJsonValue(QJsonArray{-1}) << false;
+        QTest::newRow("fraction") << QJsonValue(QJsonArray{1.5}) << false;
+        QTest::newRow("malformed-after-valid")
+            << QJsonValue(QJsonArray{1, QStringLiteral("2")}) << false;
+    }
+
+    void modernOrphanBindingsAreValidAndMalformedBindingsFail() {
+        QFETCH(QJsonValue, bindings);
+        QFETCH(bool, valid);
+        auto raw = modernRecord();
+        if (bindings.isUndefined())
+            raw.remove(QStringLiteral("inboundIds"));
+        else
+            raw.insert(QStringLiteral("inboundIds"), bindings);
+        const auto result =
+            ThreeXUiApi::parseInventory({}, QJsonArray{raw}, QStringLiteral("server-one"), true);
+        QCOMPARE(result.ok, valid);
+        if (valid) {
+            QCOMPARE(result.value.clients.size(), 1);
+            QVERIFY(result.value.clients.first().inboundIds.isEmpty());
+        }
+    }
+
+    void orphanDeleteRequiresFreshEmptyBindings() {
+        MockPanel mock;
+        ThreeXUiApi api(configuration(mock));
+        auto raw = modernRecord();
+        raw.insert(QStringLiteral("inboundIds"), QJsonValue::Null);
+        const Client orphan =
+            ThreeXUiApi::parseInventory({}, QJsonArray{raw}, QStringLiteral("server-one"), true)
+                .value.clients.first();
+        mock.add(200, envelope(freshResponse(raw)));
+        mock.add(200, envelope());
+        bool done = false;
+        Outcome<bool> result;
+        api.deleteClient(orphan, [&](Outcome<bool> value) {
+            result = std::move(value);
+            done = true;
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(done, 3000);
+        QVERIFY2(result.ok, qPrintable(result.error));
+        QCOMPARE(mock.requests.size(), 2);
+        QVERIFY(mock.requests.last().target.contains("/clients/del/"));
+        raw.insert(QStringLiteral("inboundIds"), QJsonArray{1});
+        mock.add(200, envelope(freshResponse(raw)));
+        done = false;
+        api.resetClientTraffic(orphan, [&](Outcome<bool> value) {
+            result = std::move(value);
+            done = true;
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(done, 3000);
+        QVERIFY(!result.ok);
+        QCOMPARE(mock.requests.size(), 3);
+    }
+
+    void mixedInboundsUseOneSuppliedIdentity() {
+        MockPanel mock;
+        ThreeXUiApi api(configuration(mock));
+        mock.add(200, envelope(QJsonArray{inbound(1), inbound(2, QStringLiteral("vmess")),
+                                          inbound(3, QStringLiteral("trojan"))}));
+        mock.add(200, envelope(QJsonArray{}));
+        mock.add(200, envelope());
+        mock.reflectCreatedClient(true);
+        auto draft = sharedDraft();
+        draft.inboundIds = {1, 2, 3};
+        draft.flow.clear();
+        bool done = false;
+        Outcome<bool> result;
+        api.createClient(draft, [&](Outcome<bool> value) {
+            result = std::move(value);
+            done = true;
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(done, 3000);
+        QVERIFY2(result.ok, qPrintable(result.error));
+        QCOMPARE(mock.requests.size(), 4);
+        const auto body = QJsonDocument::fromJson(mock.requests.at(2).body).object();
+        QCOMPARE(body.value(QStringLiteral("inboundIds")).toArray(), (QJsonArray{1, 2, 3}));
+        const auto client = body.value(QStringLiteral("client")).toObject();
+        QCOMPARE(client.value(QStringLiteral("id")).toString(), draft.clientId);
+        QCOMPARE(client.value(QStringLiteral("password")).toString(), draft.password);
+        QCOMPARE(client.value(QStringLiteral("subId")).toString(), draft.subId);
+        QCOMPARE(client.value(QStringLiteral("security")).toString(), QStringLiteral("auto"));
+    }
+
+    void legacyRejectsMultipleInboundsBeforeWriting() {
+        MockPanel mock;
+        ThreeXUiApi api(configuration(mock, ApiFlavor::LegacyV2));
+        bool done = false;
+        Outcome<bool> result;
+        api.createClient(sharedDraft(), [&](Outcome<bool> value) {
+            result = std::move(value);
+            done = true;
+        });
+        QTRY_VERIFY(done);
+        QVERIFY(!result.ok);
+        QVERIFY(mock.requests.isEmpty());
+    }
+
+    void exactSyncedIdentityIsIdempotentAndOnlyMissingBindingsAttach_data() {
+        QTest::addColumn<bool>("missing");
+        QTest::newRow("already-synced") << false;
+        QTest::newRow("attach-one-missing") << true;
+    }
+
+    void exactSyncedIdentityIsIdempotentAndOnlyMissingBindingsAttach() {
+        QFETCH(bool, missing);
+        MockPanel mock;
+        ThreeXUiApi api(configuration(mock));
+        auto raw = modernRecord();
+        if (missing)
+            raw.insert(QStringLiteral("inboundIds"), QJsonArray{1});
+        mock.add(200, envelope(QJsonArray{inbound(1), inbound(2)}));
+        mock.add(200, envelope(QJsonArray{raw}));
+        mock.add(200, envelope(freshResponse(raw)));
+        if (missing) {
+            mock.add(200, envelope(QJsonArray{inbound(1), inbound(2)}));
+            mock.add(200, envelope());
+            mock.add(200, envelope(freshResponse()));
+        }
+        bool done = false;
+        Outcome<bool> result;
+        api.createClient(sharedDraft(), [&](Outcome<bool> value) {
+            result = std::move(value);
+            done = true;
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(done, 3000);
+        QVERIFY2(result.ok, qPrintable(result.error));
+        QCOMPARE(mock.requests.size(), missing ? 6 : 3);
+        int writes = 0;
+        for (const auto& request : mock.requests)
+            if (request.method == "POST") {
+                ++writes;
+                QVERIFY(request.target.endsWith("/attach"));
+                QCOMPARE(QJsonDocument::fromJson(request.body)
+                             .object()
+                             .value(QStringLiteral("inboundIds"))
+                             .toArray(),
+                         (QJsonArray{2}));
+            }
+        QCOMPARE(writes, missing ? 1 : 0);
+    }
+
+    void collisionsAndChangedFieldsNeverWrite_data() {
+        QTest::addColumn<QString>("field");
+        for (const auto& field : {"uuid", "password", "subId", "totalGB", "expiryTime", "enable",
+                                  "flow", "inboundIds", "case"})
+            QTest::newRow(field) << QString::fromLatin1(field);
+    }
+
+    void collisionsAndChangedFieldsNeverWrite() {
+        QFETCH(QString, field);
+        MockPanel mock;
+        ThreeXUiApi api(configuration(mock));
+        auto raw = modernRecord();
+        if (field == QStringLiteral("totalGB") || field == QStringLiteral("expiryTime"))
+            raw.insert(field, 1);
+        else if (field == QStringLiteral("enable"))
+            raw.insert(field, false);
+        else if (field == QStringLiteral("inboundIds"))
+            raw.insert(field, QJsonArray{1, 2, 3});
+        else if (field == QStringLiteral("case"))
+            raw.insert(QStringLiteral("email"),
+                       raw.value(QStringLiteral("email")).toString().toUpper());
+        else
+            raw.insert(field, QStringLiteral("different"));
+        mock.add(200, envelope(QJsonArray{inbound(1), inbound(2)}));
+        mock.add(200, envelope(QJsonArray{raw}));
+        if (field != QStringLiteral("case"))
+            mock.add(200, envelope(freshResponse(raw)));
+        bool done = false;
+        Outcome<bool> result;
+        api.createClient(sharedDraft(), [&](Outcome<bool> value) {
+            result = std::move(value);
+            done = true;
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(done, 3000);
+        QVERIFY(!result.ok);
+        for (const auto& request : mock.requests)
+            QCOMPARE(request.method, QByteArray("GET"));
+    }
+
+    void createdClientMismatchIsPartialFailureWithoutRollback() {
+        MockPanel mock;
+        ThreeXUiApi api(configuration(mock));
+        mock.add(200, envelope(QJsonArray{inbound(1), inbound(2)}));
+        mock.add(200, envelope(QJsonArray{}));
+        mock.add(200, envelope());
+        auto changed = modernRecord();
+        changed.insert(QStringLiteral("uuid"), QStringLiteral("foreign-identity"));
+        mock.add(200, envelope(freshResponse(changed)));
+        bool done = false;
+        Outcome<bool> result;
+        api.createClient(sharedDraft(), [&](Outcome<bool> value) {
+            result = std::move(value);
+            done = true;
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(done, 3000);
+        QVERIFY(!result.ok);
+        QVERIFY(result.error.contains(QStringLiteral("Клиент создан")));
+        QCOMPARE(mock.requests.size(), 4);
+        QCOMPARE(mock.requests.at(2).method, QByteArray("POST"));
+        QCOMPARE(mock.requests.last().method, QByteArray("GET"));
+    }
+
+    void disableFailureReportsCreatedStateWithoutRollback() {
+        MockPanel mock;
+        ThreeXUiApi api(configuration(mock));
+        mock.add(200, envelope(QJsonArray{inbound(1), inbound(2)}));
+        mock.add(200, envelope(QJsonArray{}));
+        mock.add(200, envelope());
+        mock.reflectCreatedClient(true);
+        mock.add(200, {{QStringLiteral("success"), false},
+                       {QStringLiteral("msg"), QStringLiteral("secret")}});
+        auto draft = sharedDraft();
+        draft.enable = false;
+        bool done = false;
+        Outcome<bool> result;
+        api.createClient(draft, [&](Outcome<bool> value) {
+            result = std::move(value);
+            done = true;
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(done, 3000);
+        QVERIFY(!result.ok);
+        QVERIFY(result.error.contains(QStringLiteral("Клиент создан")));
+        QVERIFY(!result.error.contains(QStringLiteral("secret")));
+        QCOMPARE(mock.requests.size(), 5);
+        QVERIFY(mock.requests.last().target.contains("/clients/update/"));
+    }
+
+    void invalidPrecisionAndVisionMixedTargetsRejectWithoutWrite() {
+        MockPanel mock;
+        ThreeXUiApi api(configuration(mock));
+        auto draft = sharedDraft();
+        draft.totalBytes = 9007199254740992LL;
+        bool done = false;
+        Outcome<bool> result;
+        api.createClient(draft, [&](Outcome<bool> value) {
+            result = std::move(value);
+            done = true;
+        });
+        QTRY_VERIFY(done);
+        QVERIFY(!result.ok);
+        QVERIFY(mock.requests.isEmpty());
+        draft = sharedDraft();
+        mock.add(200, envelope(QJsonArray{inbound(1), inbound(2, QStringLiteral("vmess"))}));
+        done = false;
+        api.createClient(draft, [&](Outcome<bool> value) {
+            result = std::move(value);
+            done = true;
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(done, 3000);
+        QVERIFY(!result.ok);
+        QCOMPARE(mock.requests.size(), 1);
+    }
+
+    void downloadReturnsVerifiedBinaryAndUsesOwnPermission() {
+        MockPanel mock;
+        ThreeXUiApi api(configuration(mock, ApiFlavor::Auto));
+        const auto data = sqliteFixture();
+        QVERIFY(inspectDatabaseBackup(data).ok);
+        mock.responses.append({200, data, {{"Content-Type", "application/octet-stream"}}});
+        bool done = false;
+        Outcome<QByteArray> result;
+        api.downloadDatabase([&](Outcome<QByteArray> value) {
+            result = std::move(value);
+            done = true;
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(done, 3000);
+        QVERIFY2(result.ok, qPrintable(result.error));
+        QCOMPARE(result.value, data);
+        QCOMPARE(mock.requests.size(), 1);
+        QCOMPARE(mock.requests.first().target, QByteArray("/secret/base/panel/api/server/getDb"));
+        QCOMPARE(mock.requests.first().headers.value("authorization"),
+                 QByteArray("Bearer test-token"));
+        QCOMPARE(api.detectedFlavor(), ApiFlavor::Auto);
+    }
+
+    void downloadRejectsHtmlJsonAndOversizeHeaders_data() {
+        QTest::addColumn<QByteArray>("body");
+        QTest::addColumn<bool>("oversized");
+        QTest::newRow("html-login")
+            << QByteArray("<!DOCTYPE html><html>secret-password</html>") << false;
+        QTest::newRow("json-error")
+            << QByteArray("{\"success\":false,\"msg\":\"secret-token\"}") << false;
+        QTest::newRow("oversized") << QByteArray() << true;
+    }
+
+    void downloadRejectsHtmlJsonAndOversizeHeaders() {
+        QFETCH(QByteArray, body);
+        QFETCH(bool, oversized);
+        MockPanel mock;
+        ThreeXUiApi api(configuration(mock));
+        QMap<QByteArray, QByteArray> headers;
+        if (oversized)
+            headers.insert("Content-Length", QByteArray::number(MaximumBackupBytes + 1));
+        mock.responses.append({200, body, headers});
+        bool done = false;
+        Outcome<QByteArray> result;
+        api.downloadDatabase([&](Outcome<QByteArray> value) {
+            result = std::move(value);
+            done = true;
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(done, 3000);
+        QVERIFY(!result.ok);
+        QVERIFY(!result.error.contains(QStringLiteral("secret")));
+        QCOMPARE(mock.requests.size(), 1);
+        if (oversized)
+            QVERIFY(result.error.contains(QStringLiteral("128")));
+    }
+
+    void restoreMultipartCarriesFileAndHostPolicy_data() {
+        QTest::addColumn<bool>("keep");
+        QTest::newRow("safe-host-settings") << true;
+        QTest::newRow("full-clone") << false;
+    }
+
+    void restoreMultipartCarriesFileAndHostPolicy() {
+        QFETCH(bool, keep);
+        MockPanel mock;
+        ThreeXUiApi api(configuration(mock, ApiFlavor::Auto));
+        mock.add(200, envelope());
+        const auto data = sqliteFixture();
+        bool done = false;
+        Outcome<bool> result;
+        api.restoreDatabase(data, keep, [&](Outcome<bool> value) {
+            result = std::move(value);
+            done = true;
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(done, 3000);
+        QVERIFY2(result.ok, qPrintable(result.error));
+        QCOMPARE(mock.requests.size(), 1);
+        const auto& request = mock.requests.first();
+        QCOMPARE(request.target, QByteArray("/secret/base/panel/api/server/importDB"));
+        QVERIFY(request.headers.value("content-type").startsWith("multipart/form-data; boundary="));
+        QVERIFY(request.body.contains("name=\"db\"; filename=\"fleet.db\""));
+        QVERIFY(request.body.contains(data));
+        QVERIFY(request.body.contains("name=\"keepHostSettings\""));
+        QVERIFY(request.body.contains(keep ? "\r\n\r\ntrue\r\n" : "\r\n\r\nfalse\r\n"));
+    }
+
+    void restoreRejectsUnconfirmedResponsesAndNeverRetries_data() {
+        QTest::addColumn<int>("status");
+        QTest::addColumn<QByteArray>("body");
+        QTest::newRow("success-false")
+            << 200 << QByteArray("{\"success\":false,\"msg\":\"secret-token\"}");
+        QTest::newRow("missing-success") << 200 << QByteArray("{}");
+        QTest::newRow("invalid-json") << 200 << QByteArray("<html>secret-token</html>");
+        QTest::newRow("forbidden") << 403 << QByteArray("{}");
+        QTest::newRow("connection-drop") << -1 << QByteArray();
+        QTest::newRow("redirect") << 302 << QByteArray("{}");
+    }
+
+    void restoreRejectsUnconfirmedResponsesAndNeverRetries() {
+        QFETCH(int, status);
+        QFETCH(QByteArray, body);
+        MockPanel mock;
+        ThreeXUiApi api(configuration(mock));
+        mock.responses.append(
+            {status, body, {{"Location", mock.url().toEncoded() + "redirected"}}});
+        bool done = false;
+        Outcome<bool> result;
+        api.restoreDatabase(sqliteFixture(), true, [&](Outcome<bool> value) {
+            result = std::move(value);
+            done = true;
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(done, 3000);
+        QVERIFY(!result.ok);
+        QVERIFY(!result.error.contains(QStringLiteral("secret-token")));
+        QTest::qWait(30);
+        QCOMPARE(mock.requests.size(), 1);
+        if (status == -1)
+            QVERIFY(result.error.contains(QStringLiteral("неизвестен")));
+    }
+
+    void jsonMutationDropIsNotReplayedByTransport() {
+        MockPanel mock;
+        ThreeXUiApi api(configuration(mock));
+        mock.responses.append({-1, {}, {}});
+        bool done = false;
+        Outcome<bool> result;
+        api.serverAction(ServerAction::RestartXray, {}, [&](Outcome<bool> value) {
+            result = std::move(value);
+            done = true;
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(done, 3000);
+        QVERIFY(!result.ok);
+        QVERIFY(result.error.contains(QStringLiteral("неизвестен")));
+        QTest::qWait(30);
+        QCOMPARE(mock.requests.size(), 1);
+        QCOMPARE(mock.requests.first().target,
+                 QByteArray("/secret/base/panel/api/server/restartXrayService"));
+    }
+
+    void invalidRestoreDoesNotSendAndPendingRestoreCanBeDestroyed() {
+        MockPanel mock;
+        auto* api = new ThreeXUiApi(configuration(mock));
+        bool done = false;
+        Outcome<bool> result;
+        api->restoreDatabase(QByteArray("not-a-database"), true, [&](Outcome<bool> value) {
+            result = std::move(value);
+            done = true;
+        });
+        QTRY_VERIFY(done);
+        QVERIFY(!result.ok);
+        QVERIFY(mock.requests.isEmpty());
+        mock.hold();
+        bool pendingCallback = false;
+        api->restoreDatabase(sqliteFixture(), true, [&](Outcome<bool>) { pendingCallback = true; });
+        QTRY_COMPARE_WITH_TIMEOUT(mock.requests.size(), 1, 3000);
+        delete api;
+        QTest::qWait(30);
+        QVERIFY(!pendingCallback);
+    }
+
+    void backupCookieCsrfAndCallbackDestruction() {
+        MockPanel mock;
+        auto config = configuration(mock, ApiFlavor::Auto);
+        config.auth = AuthKind::Password;
+        config.username = QStringLiteral("user");
+        config.password = QStringLiteral("password");
+        auto* api = new ThreeXUiApi(config);
+        mock.add(200, envelope(QStringLiteral("pre")));
+        mock.add(200, envelope(), {{"Set-Cookie", "session=backup-session; Path=/; HttpOnly"}});
+        mock.add(200, envelope(QStringLiteral("post")));
+        mock.add(200, envelope());
+        bool done = false;
+        bool queued = false;
+        api->restoreDatabase(sqliteFixture(), true, [&](Outcome<bool> value) {
+            done = value.ok;
+            delete api;
+        });
+        api->downloadDatabase([&](Outcome<QByteArray>) { queued = true; });
+        QTRY_VERIFY_WITH_TIMEOUT(done, 3000);
+        QTest::qWait(30);
+        QVERIFY(!queued);
+        QCOMPARE(mock.requests.size(), 4);
+        QCOMPARE(mock.requests.last().headers.value("x-csrf-token"), QByteArray("post"));
+        QVERIFY(mock.requests.last().headers.value("cookie").contains("session=backup-session"));
     }
 
     void serverActionsUseOwnEndpointPermissions() {

@@ -19,6 +19,7 @@ class QFrame;
 namespace fleet {
 class ThreeXUiApi;
 class ChartWidget;
+class ClientProvisioner;
 class MainWindow : public QMainWindow {
     Q_OBJECT
   public:
@@ -47,6 +48,8 @@ class MainWindow : public QMainWindow {
     int activeInventories_ = 0;
     int pollSeconds_ = 30;
     int rangeHours_ = 8;
+    QString masterServerId_;
+    bool hasMasterPreference_ = false;
     bool demo_ = false;
     bool polling_ = false;
     bool mutating_ = false;
@@ -66,6 +69,8 @@ class MainWindow : public QMainWindow {
     QPushButton* demoButton_ = nullptr;
     QComboBox* rangeCombo_ = nullptr;
     QComboBox* serverFilter_ = nullptr;
+    QComboBox* masterCombo_ = nullptr;
+    QLabel* masterStatus_ = nullptr;
     QLineEdit* serverSearch_ = nullptr;
     QLineEdit* clientSearch_ = nullptr;
     QTableWidget* serverTable_ = nullptr;
@@ -79,6 +84,7 @@ class MainWindow : public QMainWindow {
     ChartWidget* onlineChart_ = nullptr;
     ChartWidget* trafficChart_ = nullptr;
     QSpinBox* intervalBox_ = nullptr;
+    ClientProvisioner* provisioner_ = nullptr;
     void buildUi();
     QWidget* overviewPage();
     QWidget* serversPage();
@@ -107,6 +113,11 @@ class MainWindow : public QMainWindow {
     void renewClient();
     void deleteClient();
     void resetClient();
+    void backupServer();
+    void restoreServer();
+    void refreshMasterSelector();
+    QString activeMasterServerId() const;
+    void copySubscriptionLink();
     void runServerAction(ServerAction action);
     void completeMutation(const QString& serverId, const QString& action, OperationResult result);
     void recordEvent(const QString& serverId, const QString& action, bool success,

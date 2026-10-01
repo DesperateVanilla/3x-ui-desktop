@@ -1,0 +1,14 @@
+C:\WINDOWS\System32\msvcp_win.dll
+F:\Agent\swarm\3x-ui-desktop\dist\3X-Control-0.2\Qt6Sql.dll
+F:\Agent\swarm\3x-ui-desktop\dist\3X-Control-0.2\Qt6Network.dll
+F:\Agent\swarm\3x-ui-desktop\dist\3X-Control-0.2\MSVCP140.dll
+F:\Agent\swarm\3x-ui-desktop\dist\3X-Control-0.2\Qt6Widgets.dll
+F:\Agent\swarm\3x-ui-desktop\dist\3X-Control-0.2\VCRUNTIME140.dll
+F:\Agent\swarm\3x-ui-desktop\dist\3X-Control-0.2\Qt6Gui.dll
+F:\Agent\swarm\3x-ui-desktop\dist\3X-Control-0.2\Qt6Core.dll
+F:\Agent\swarm\3x-ui-desktop\dist\3X-Control-0.2\VCRUNTIME140_1.dll
+F:\Agent\swarm\3x-ui-desktop\dist\3X-Control-0.2\MSVCP140_1.dll
+F:\Agent\swarm\3x-ui-desktop\dist\3X-Control-0.2\MSVCP140_2.dll
+F:\Agent\swarm\3x-ui-desktop\dist\3X-Control-0.2\platforms\qwindows.dll
+F:\Agent\swarm\3x-ui-desktop\dist\3X-Control-0.2\tls\qschannelbackend.dll
+F:\Agent\swarm\3x-ui-desktop\dist\3X-Control-0.2\sqldrivers\qsqlite.dll
