@@ -1,0 +1,9 @@
+/.tools/
+/build/
+/dist/
+/.agentboard/
+*.user
+*.log
+*.db
+*.db-shm
+*.db-wal

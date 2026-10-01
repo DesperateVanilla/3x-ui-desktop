@@ -1,0 +1,16 @@
+********* Start testing of StorageTests *********
+Config: Using QtTest library 6.8.3, Qt 6.8.3 (x86_64-little_endian-llp64 shared (dynamic) release build; by MSVC 2022), windows 11
+PASS   : StorageTests::initTestCase()
+PASS   : StorageTests::dpapiEnvelopeAndCorruption()
+PASS   : StorageTests::encryptedConfigurationAndReopen()
+PASS   : StorageTests::updateAndMissingRows()
+PASS   : StorageTests::corruptedCredentialRowsFailWithoutFallback()
+PASS   : StorageTests::nullableMetricsAndChronologicalHistory()
+PASS   : StorageTests::duplicateWindowAndForeignKeyCascade()
+PASS   : StorageTests::eventOrderLimitsAndPruning()
+PASS   : StorageTests::schemaVersionAndIndependentConnections()
+PASS   : StorageTests::downsampledHistoryPreservesRangeLastSampleAndWorstHealth()
+PASS   : StorageTests::closedStoreInvalidInputAndThreadAffinity()
+PASS   : StorageTests::cleanupTestCase()
+Totals: 12 passed, 0 failed, 0 skipped, 0 blacklisted, 570ms
+********* Finished testing of StorageTests *********

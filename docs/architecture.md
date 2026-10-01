@@ -1,0 +1,39 @@
+# 3X Control — Windows, C++17 / Qt 6
+
+Нативное Windows-приложение Qt Widgets с тёмным интерфейсом, таймлайнами доступности, графиками онлайна и трафика. Подключается напрямую к нескольким 3x-ui. Первое открытие показывает пустой список с кнопкой добавления сервера; демо включается отдельно, его данные не сохраняются и сетевые операции отключены.
+
+## Контракты
+
+src/domain.h — структуры и Outcome<T>. src/three_x_ui_api.h — асинхронный API, src/local_store.h — SQLite. src/main_window.cpp управляет интерфейсом и очередями опроса, src/chart_widget.cpp рисует графики, src/editor_dialogs.cpp проверяет ввод и формирует изменения клиента.
+
+Сеть работает через QObject/QNetworkAccessManager/QTimer без блокировки GUI. Операции одного адаптера последовательны через очередь. Callback вызывается один раз и не вызывается после уничтожения QObject. Ошибки одного сервера не останавливают другие. GUI ограничивает каждую очередь опроса пятью активными серверами. Статус проверяется каждые 30с по умолчанию; следующий цикл не перекрывает предыдущий. Изменения клиентов могут выполняться во время мониторинга; изменение подключения ждёт окончания фоновых запросов. Пока открыта модальная форма, новый опрос не запускается. После изменения клиента перечитывается только его сервер. История хранится 30 дней, очистка выполняется при запуске и смене дня. Промежутки без замеров неизвестны. Секреты не попадают в журнал или сообщения об ошибках.
+
+## 3x-ui 3.7.0 (подтверждено исходниками) и старый v2
+
+URL = https://host:port/secret-base-path/; сохранять путь. validatePanelUrl: только https; http если config.allowHttp=true явно выбран пользователем; URL userinfo/query/fragment запрещены. Разрешать локальные серверы: это desktop app, SSRF веб-бэкенда здесь нет. TLS всегда проверять, ignoreSslErrors запрещён. RedirectPolicy ManualRedirectPolicy. Таймаут одного запроса 8с; response size limit 16MB.
+
+Token: Authorization Bearer, X-Requested-With XMLHttpRequest. Cookie password login: GET /csrf-token (obj string), then POST /login JSON username/password/twoFactorCode + X-CSRF-Token. Старый v2 без csrf endpoint допускается только при 404; после успешного login обновить csrf token. Session cookies живут только в QNAM данного сервера. Auth/session ошибки сбрасывают loggedIn_; для безопасного чтения возможно повторное login в следующий опрос. Мутации никогда автоматически не повторять. Timeout мутации: результат неизвестен, обновите список перед повторением.
+
+Modern readonly discovery GET /panel/api/clients/list. При 404/405 → Legacy; если success=false/auth/network error — не переходить в другую версию. Explicit flavor не обнаруживать. cached detection только для адаптера.
+
+Common GET /panel/api/inbounds/list. V2 inbounds.settings — строка JSON с clients; clientStats email up down. V3 GET /panel/api/clients/list → массив flat ClientRecord с inboundIds и optional traffic. ClientRecord имеет numeric id, uuid (идентификатор доступа), password, email, subId, enable, totalGB (байты!), expiryTime (мс), flow, security, limitIp, limitHwid etc. parseInventory сохраняет opaque raw; id для доступа = uuid/строковый id/password; связывает protocol по inboundIds. Клиент может быть на нескольких inbound.
+
+V3 GET /panel/api/clients/get/:email → obj {client:flat ClientRecord, inboundIds:[...], usedTraffic:bytes,...}. Для UPDATE преобразовать numeric id в строковый client id из uuid; model.Client ID должен быть uuid, НЕ database id! Сохранить неизвестные поля, uuid, password, subId, flow, security, limitHwid и ограничения. Перед update/delete/reset проверить свежий клиент с сервера: совпадение UUID/password/email и inboundIds. V3 глобальная запись: delete удаляет клиента со всех его inbound на ЭТОМ сервере; GUI сообщает это. update применять глобально, без inboundIds фильтра. Результат success=true обязателен.
+
+POST V3 /panel/api/clients/add JSON {client:{id:uuid,email,totalGB,expiryTime,enable,subId,flow,security,limitIp:0,limitHwid:0,tgId:0,comment:"",reset:0},inboundIds:[draft.inboundId]}. Vless/vmess id uuid, vmess security auto, trojan password random; создание shadowsocks не реализовывать без поддержки шифра inbound; выдавать понятную unsupported ошибку. Create перечитывает inbound по id и проверяет enable и протокол. subId 24 символа криптографический случайный. Flow = draft.flow (GUI выбор пусто/xtls-rprx-vision).
+
+V3 POST /panel/api/clients/update/:email JSON полный model.Client. POST /panel/api/clients/del/:email. POST /panel/api/clients/resetTraffic/:email. V2 POST /panel/api/inbounds/addClient и /updateClient/:id form id=<inboundId>&settings=<string JSON {clients:[full client]}>. V2 POST /panel/api/inbounds/:inboundId/delClient/:clientId; reset /:inboundId/resetClientTraffic/:email. Параметры percent-encoded. UUID для vless/vmess; password для trojan. V2 перед любым изменением перечитать inbounds/list, проверить один inbound + client id/email, сохранить поля. И никогда не автоматически пробовать другую mutation endpoint.
+
+GET /panel/api/server/status → obj cpu (проценты 0..100), mem.current/total, disk.current/total, netIO.up/down (cumulative bytes sent/received), netTraffic.sent/recv (bytes/s), uptime seconds, panelVersion, xray.version/state. Для older v2 допускается read-only fallback /panel/server/status только 404. xray.state running=Online, stop/error=Warning. Отсутствие поля = std::nullopt, не ноль. fetchStatus дополнительно POST onlines по известному flavor: V3 /panel/api/clients/onlines, V2 /panel/api/inbounds/onlines. Недоступный online = nullopt; метрики при этом не терять. Endpoint onlines читает состояние, безопасен. parseStatus не включает remote errorMsg (может содержать секрет).
+
+ServerAction: restart → POST /panel/api/server/restartXrayService; geofiles → /updateGeofile; install → /installXray/:version; version regex ^v?[0-9]+(\.[0-9]+){1,3}$; без shell/SSH. UI подтверждение каждую потенциально отключающую операцию. Не добавлять обновление самой панели через install.sh: отдельная будущая возможность.
+
+## SQLite и Windows DPAPI
+
+База в QStandardPaths::AppLocalDataLocation/fleet.db. GUI передает путь в open. Именованное соединение SQLite, WAL, foreign_keys ON, busy timeout. DDL только при open в транзакции; PRAGMA user_version для простой миграции. servers: id PK, name/location/panel_url/subscription_url/auth/api/allow_http + credentials BLOB. credentials = DPAPI CryptProtectData QJson username,password,token, scope текущего пользователя, CRYPTPROTECT_UI_FORBIDDEN. TwoFactorCode никогда не записывать. DPAPI ciphertext с маркером версии. Сбой decrypt сообщить ошибкой, plaintext fallback запрещён. Windows Crypt32; на других OS сообщать unsupported. Не забывать LocalFree. Не выводить plaintext/credentialsCipher.
+
+snapshots: autoincrement id, server_id FK cascade, at UTC epoch ms, health int, nullable metrics, versions, uptime, error; idx server_id/at. events: at, server_id, server_name, action, success, detail. appendSnapshot duplicate cutoff 20s per server; история time ordered, optional server filter (empty => all); load cap <=100000 разумные агрегированные окна GUI. removeServer удаляет локальное подключение и историю в транзакции; удалённую панель не трогает. Все SQL bindValue, ошибки propagate через Outcome. prune snapshots/events older30days. Демо не сохранять в базе.
+
+## Тесты
+
+tests/core_tests.cpp — Qt Test + QTcpServer с ответами тестовой панели: v2/v3, авторизация, CSRF, мутации, сохранение идентификаторов и неизвестных полей, таймаут и ограничение размера ответа. tests/storage_tests.cpp — DPAPI, временная SQLite, секреты, каскадное удаление, NULL-метрики и агрегирование истории. tests/dialog_tests.cpp — точность квоты, срок и время UTC, изменения только выбранных полей, сохранение секретов и валидация. Запуск: `pwsh -File scripts/build.ps1 -TestsOnly`. Подробные отчёты записываются в build/*-results.txt. DPAPI требует обычной учётной записи Windows с загруженным профилем. Реальные учётные данные в тестах не используются.
