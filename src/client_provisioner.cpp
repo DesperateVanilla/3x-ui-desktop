@@ -49,7 +49,7 @@ bool validPassword(const QString& password) {
 
 QString safeText(QString text, const ServerConfig& config, const ClientDraft& draft) {
     for (const auto& secret : {config.username, config.password, config.token, config.twoFactorCode,
-                               draft.password, draft.clientId, draft.subId}) {
+                               draft.password, draft.hysteriaAuth, draft.clientId, draft.subId}) {
         if (!secret.isEmpty())
             text.replace(secret, QStringLiteral("[скрыто]"));
     }
@@ -87,7 +87,8 @@ QString validateInventory(const Inventory& inventory, const ClientTarget& target
             return QStringLiteral("Выбранный inbound удалён или отключён. Выдача не начата.");
         if (selected->protocol != QStringLiteral("vless") &&
             selected->protocol != QStringLiteral("vmess") &&
-            selected->protocol != QStringLiteral("trojan"))
+            selected->protocol != QStringLiteral("trojan") &&
+            selected->protocol != QStringLiteral("hysteria"))
             return QStringLiteral(
                 "Выбранный протокол не поддерживает выдачу клиентов. Выдача не начата.");
         if (!draft.flow.isEmpty() && selected->protocol != QStringLiteral("vless"))
@@ -105,7 +106,9 @@ QString validateInventory(const Inventory& inventory, const ClientTarget& target
                 client.subId == draft.subId ||
                 (protocols.contains(QStringLiteral("trojan")) &&
                  (client.id == draft.password ||
-                  client.raw.value(QStringLiteral("password")).toString() == draft.password)))
+                  client.raw.value(QStringLiteral("password")).toString() == draft.password)) ||
+                (protocols.contains(QStringLiteral("hysteria")) &&
+                 client.raw.value(QStringLiteral("auth")).toString() == draft.hysteriaAuth))
                 return QStringLiteral(
                     "Email, UUID, пароль или subId уже заняты другим клиентом. Выдача не начата.");
             continue;
@@ -120,6 +123,8 @@ QString validateInventory(const Inventory& inventory, const ClientTarget& target
     const QString expectedId =
         flavor == ApiFlavor::LegacyV2 && protocols.contains(QStringLiteral("trojan"))
             ? draft.password
+        : flavor == ApiFlavor::LegacyV2 && protocols.contains(QStringLiteral("hysteria"))
+            ? draft.hysteriaAuth
             : draft.clientId;
     if (existing->id != expectedId || existing->subId != draft.subId ||
         existing->totalBytes != draft.totalBytes || existing->expiryTime != draft.expiryTime ||
@@ -127,6 +132,8 @@ QString validateInventory(const Inventory& inventory, const ClientTarget& target
         existing->raw.value(QStringLiteral("flow")).toString() != draft.flow ||
         (protocols.contains(QStringLiteral("trojan")) &&
          existing->raw.value(QStringLiteral("password")).toString() != draft.password) ||
+        (protocols.contains(QStringLiteral("hysteria")) &&
+         existing->raw.value(QStringLiteral("auth")).toString() != draft.hysteriaAuth) ||
         (protocols.contains(QStringLiteral("vmess")) &&
          existing->raw.value(QStringLiteral("security")).toString() != QStringLiteral("auto")))
         return QStringLiteral("Email уже занят клиентом с другими параметрами или идентификатором. "
@@ -185,7 +192,7 @@ void ClientProvisioner::provision(const QList<ClientTarget>& targets, const Clie
         (!draft.flow.isEmpty() && draft.flow != QStringLiteral("xtls-rprx-vision")) ||
         (!draft.clientId.isEmpty() &&
          (!uuidPattern.match(draft.clientId).hasMatch() || QUuid(draft.clientId).isNull())) ||
-        !validPassword(draft.password) ||
+        !validPassword(draft.password) || !validPassword(draft.hysteriaAuth) ||
         (!draft.subId.isEmpty() && !subIdPattern.match(draft.subId).hasMatch())) {
         reject(QStringLiteral("Неверные цели, email, квота, срок или общие параметры клиента."));
         return;
@@ -221,6 +228,8 @@ void ClientProvisioner::provision(const QList<ClientTarget>& targets, const Clie
         run->draft.clientId = QUuid::createUuid().toString(QUuid::WithoutBraces);
     if (run->draft.password.isEmpty())
         run->draft.password = randomSecret(32);
+    if (run->draft.hysteriaAuth.isEmpty())
+        run->draft.hysteriaAuth = randomSecret(32);
     if (run->draft.subId.isEmpty())
         run->draft.subId = randomSecret(24);
     run->summary.clientId = run->draft.clientId;

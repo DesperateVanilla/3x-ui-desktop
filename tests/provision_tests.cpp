@@ -182,6 +182,30 @@ class ProvisionTests : public QObject {
         QVERIFY(trace.indexOf("child:GET /base/panel/api/clients/list") < firstWrite);
         QVERIFY(firstWrite < trace.indexOf("master:POST /base/panel/api/clients/add"));
     }
+    void hysteriaSharesAuthAcrossServersAndAllowsMixedInbounds() {
+        QStringList trace;
+        Panel master("master", &trace), child("child", &trace);
+        master.inbounds = {Panel::inbound(1, "vless"), Panel::inbound(2, "hysteria")};
+        child.inbounds = {Panel::inbound(1, "trojan"), Panel::inbound(2, "hysteria")};
+        ThreeXUiApi a(master.config()), b(child.config());
+        ClientProvisioner coordinator({{"master", &a}, {"child", &b}});
+        bool done = false;
+        Outcome<ProvisionSummary> result;
+        coordinator.provision({{"master", {1, 2}}, {"child", {1, 2}}}, draft(), "master",
+                              [&](auto value) {
+                                  result = std::move(value);
+                                  done = true;
+                              });
+        QTRY_VERIFY_WITH_TIMEOUT(done, 3000);
+        QVERIFY2(result.ok, qPrintable(result.error));
+        QVERIFY(result.value.nodes[0].ok && result.value.nodes[1].ok);
+        const auto left = master.writes.first().value("client").toObject(),
+                   right = child.writes.first().value("client").toObject();
+        QCOMPARE(left.value("auth"), right.value("auth"));
+        QCOMPARE(left.value("auth").toString().size(), 32);
+        QCOMPARE(left.value("id"), right.value("id"));
+        QCOMPARE(left.value("subId"), right.value("subId"));
+    }
     void rejectedSecondServerLeavesBothUnchanged_data() {
         QTest::addColumn<QString>("problem");
         for (const auto* item :

@@ -83,6 +83,8 @@ QWARN  : DialogTests::clientValidationKeepsDialogOpen(control) This plugin does 
 PASS   : DialogTests::clientValidationKeepsDialogOpen(control)
 QWARN  : DialogTests::supportedInboundsAndFlowFollowSelection() This plugin does not support propagateSizeHints()
 PASS   : DialogTests::supportedInboundsAndFlowFollowSelection()
+QWARN  : DialogTests::hysteriaTargetIsSelectableAndClearsVision() This plugin does not support propagateSizeHints()
+PASS   : DialogTests::hysteriaTargetIsSelectableAndClearsVision()
 QWARN  : DialogTests::selectAllGroupsTargetsAcrossServers() This plugin does not support propagateSizeHints()
 PASS   : DialogTests::selectAllGroupsTargetsAcrossServers()
 QWARN  : DialogTests::longUnicodeEmailRemainsSupportedAndFooterOutsideScroll() This plugin does not support propagateSizeHints()
@@ -115,5 +117,5 @@ PASS   : DialogTests::masterCanBeDeselected()
 QWARN  : DialogTests::editPreservesAllBindingsWithDifferentMaster() This plugin does not support propagateSizeHints()
 PASS   : DialogTests::editPreservesAllBindingsWithDifferentMaster()
 PASS   : DialogTests::cleanupTestCase()
-Totals: 47 passed, 0 failed, 0 skipped, 0 blacklisted, 184ms
+Totals: 48 passed, 0 failed, 0 skipped, 0 blacklisted, 186ms
 ********* Finished testing of DialogTests *********

@@ -412,6 +412,22 @@ class DialogTests : public QObject {
         QCOMPARE(dialog.draft().email.size(), qsizetype(128));
     }
 
+    void hysteriaTargetIsSelectableAndClearsVision() {
+        auto data = inventories();
+        data["server-one"].inbounds.append(
+            {"server-one", 6, "Hysteria 2", "hysteria", 11891, true});
+        ClientDialog dialog({serverConfig()}, data);
+        QSignalSpy accepted(&dialog, &QDialog::accepted);
+        show(dialog);
+        auto* target = inboundNode(dialog, "server-one", 6);
+        QVERIFY(target->flags() & Qt::ItemIsEnabled);
+        selectTarget(dialog, "server-one", 6);
+        field<QLineEdit>(dialog, "email")->setText("hy2-client");
+        saveButton(dialog)->click();
+        QCOMPARE(accepted.count(), 1);
+        QCOMPARE(dialog.targets().first().inboundIds, QList<int>{6});
+        QVERIFY(dialog.draft().flow.isEmpty());
+    }
     void selectAllGroupsTargetsAcrossServers() {
         ClientDialog dialog(multipleServers(), multipleInventories());
         QSignalSpy accepted(&dialog, &QDialog::accepted);

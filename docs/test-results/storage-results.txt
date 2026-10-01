@@ -12,5 +12,5 @@ PASS   : StorageTests::schemaVersionAndIndependentConnections()
 PASS   : StorageTests::downsampledHistoryPreservesRangeLastSampleAndWorstHealth()
 PASS   : StorageTests::closedStoreInvalidInputAndThreadAffinity()
 PASS   : StorageTests::cleanupTestCase()
-Totals: 12 passed, 0 failed, 0 skipped, 0 blacklisted, 524ms
+Totals: 12 passed, 0 failed, 0 skipped, 0 blacklisted, 636ms
 ********* Finished testing of StorageTests *********

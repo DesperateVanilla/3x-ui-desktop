@@ -7,6 +7,7 @@
 #include <QPalette>
 #include <QSslSocket>
 #include <QStandardPaths>
+#include <QTabWidget>
 #include <QTimer>
 #include <memory>
 
@@ -14,7 +15,7 @@ int main(int argc, char** argv) {
     QApplication app(argc, argv);
     app.setApplicationName("3X Control");
     app.setOrganizationName("3XControl");
-    app.setApplicationVersion("0.2.0");
+    app.setApplicationVersion("0.3.0");
     app.setStyle("Fusion");
     app.setFont(QFont("Segoe UI", 10));
     QPalette palette;
@@ -60,6 +61,9 @@ int main(int argc, char** argv) {
     parser.addOption({"page",
                       "Показать раздел: 0 обзор, 1 серверы, 2 подписки, 3 журнал, 4 настройки.",
                       "number", "0"});
+    parser.addOption(
+        {"statistics-tab", "Вкладка статистики: 0 сеть, 1 CPU/RAM и отклик.", "number", "0"});
+    parser.addOption({"size", "Размер окна для проверки интерфейса, например 1020x720.", "pixels"});
     parser.addOption({"capture-dialog",
                       "При --capture показать форму server или client на примерах данных.",
                       "kind"});
@@ -69,8 +73,19 @@ int main(int argc, char** argv) {
         dataDir = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
     QDir().mkpath(dataDir);
     fleet::MainWindow window(dataDir, parser.isSet("demo"));
+    if (parser.isSet("size")) {
+        const auto dimensions = parser.value("size").split('x');
+        bool widthOk = false, heightOk = false;
+        const int width = dimensions.value(0).toInt(&widthOk);
+        const int height = dimensions.value(1).toInt(&heightOk);
+        if (dimensions.size() != 2 || !widthOk || !heightOk || width <= 0 || height <= 0)
+            return 2;
+        window.resize(width, height);
+    }
     window.show();
     window.showPage(parser.value("page").toInt());
+    if (auto* tabs = window.findChild<QTabWidget*>("statisticsTabs"))
+        tabs->setCurrentIndex(qBound(0, parser.value("statistics-tab").toInt(), 1));
     QWidget* captureTarget = &window;
     std::unique_ptr<QDialog> captureDialog;
     if (parser.isSet("capture") && parser.isSet("capture-dialog")) {
@@ -89,6 +104,7 @@ int main(int argc, char** argv) {
                 inventory.inbounds.append({server.id, 2, "VLESS WebSocket", "vless", 8443, true});
                 if (n == 1)
                     inventory.inbounds.append({server.id, 3, "Trojan TLS", "trojan", 9443, true});
+                inventory.inbounds.append({server.id, 4, "Hysteria 2", "hysteria", 11891, true});
                 servers.append(server);
                 inventories.insert(server.id, inventory);
             }

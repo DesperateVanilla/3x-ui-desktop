@@ -10,8 +10,12 @@
 
 namespace fleet {
 namespace {
-QString number(double v, bool bandwidth) {
-    if (!bandwidth)
+QString number(double v, ChartWidget::Kind kind) {
+    if (kind == ChartWidget::Kind::Percent)
+        return QString::number(v, 'f', 0) + " %";
+    if (kind == ChartWidget::Kind::Latency)
+        return QString::number(v, 'f', 0) + " мс";
+    if (kind != ChartWidget::Kind::Bandwidth)
         return QLocale(QLocale::Russian).toString(v, 'f', 0);
     if (v >= 1024 * 1024 * 1024)
         return QString::number(v / (1024 * 1024 * 1024), 'f', 1) + " ГБ/с";
@@ -65,6 +69,8 @@ void ChartWidget::paintEvent(QPaintEvent*) {
         }
     }
     maximum *= 1.2;
+    if (kind_ == Kind::Percent)
+        maximum = 100;
     if (kind_ == Kind::Online)
         maximum = std::max(5.0, std::ceil(maximum / 5) * 5);
     p.setFont(QFont("Segoe UI", 9));
@@ -73,7 +79,7 @@ void ChartWidget::paintEvent(QPaintEvent*) {
         p.setPen(QPen(QColor("#27303d"), 1, Qt::DotLine));
         p.drawLine(QPointF(plot.left(), y), QPointF(plot.right(), y));
         p.setPen(QColor("#8b98a9"));
-        QString label = number(maximum * i / 4, kind_ == Kind::Bandwidth);
+        QString label = number(maximum * i / 4, kind_);
         if (kind_ == Kind::Bandwidth)
             label.remove("/с");
         p.drawText(QRectF(0, y - 9, plot.left() - 9, 18), Qt::AlignRight | Qt::AlignVCenter, label);
@@ -150,7 +156,7 @@ void ChartWidget::paintEvent(QPaintEvent*) {
         p.restore();
     };
     series(false, QColor("#4c9dff"));
-    if (kind_ == Kind::Bandwidth)
+    if (kind_ == Kind::Bandwidth || kind_ == Kind::Percent)
         series(true, QColor("#46d8a9"));
     if (plot.contains(hover_) && !points_.isEmpty()) {
         const qint64 time =
@@ -164,9 +170,9 @@ void ChartWidget::paintEvent(QPaintEvent*) {
         p.drawLine(QPointF(x, plot.top()), QPointF(x, plot.bottom()));
         QString tip =
             QDateTime::fromMSecsSinceEpoch(closest->time).toString("dd.MM HH:mm") + "  ·  ";
-        tip += closest->first ? number(*closest->first, kind_ == Kind::Bandwidth) : "нет данных";
-        if (kind_ == Kind::Bandwidth)
-            tip += " / " + (closest->second ? number(*closest->second, true) : "нет данных");
+        tip += closest->first ? number(*closest->first, kind_) : "нет данных";
+        if (kind_ == Kind::Bandwidth || kind_ == Kind::Percent)
+            tip += " / " + (closest->second ? number(*closest->second, kind_) : "нет данных");
         const QFontMetrics fm(p.font());
         const int tw = qMin(width() - 16, fm.horizontalAdvance(tip) + 22);
         const QRectF box(qBound(8, hover_.x() - tw / 2, width() - tw - 8), 4, tw, 28);

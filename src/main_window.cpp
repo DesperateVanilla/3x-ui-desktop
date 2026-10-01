@@ -25,9 +25,12 @@
 #include <QRegularExpression>
 #include <QScrollArea>
 #include <QSettings>
+#include <QSignalBlocker>
 #include <QSpinBox>
+#include <QSplitter>
 #include <QStackedWidget>
 #include <QStyle>
+#include <QTabWidget>
 #include <QTableWidget>
 #include <QUuid>
 #include <QVBoxLayout>
@@ -73,6 +76,42 @@ QColor healthColor(Health h) {
     default:
         return QColor("#8694a8");
     }
+}
+QString expiryText(qint64 expiry) {
+    return expiry == 0  ? "Без срока"
+           : expiry < 0 ? "После первого входа"
+                        : QDateTime::fromMSecsSinceEpoch(expiry).toString("dd.MM.yyyy HH:mm");
+}
+QString stateText(SubscriptionState state) {
+    switch (state) {
+    case SubscriptionState::Active:
+        return "Активна";
+    case SubscriptionState::Disabled:
+        return "Отключена";
+    case SubscriptionState::Expired:
+        return "Истекла";
+    case SubscriptionState::QuotaExceeded:
+        return "Лимит исчерпан";
+    case SubscriptionState::Unbound:
+        return "Нет инбаундов";
+    case SubscriptionState::Mixed:
+        return "Есть расхождения";
+    }
+    return "—";
+}
+QString protocolText(QString protocol) {
+    return protocol == "hysteria" ? "HYSTERIA 2" : protocol.toUpper();
+}
+QString uptimeText(qint64 seconds) {
+    if (seconds <= 0)
+        return "—";
+    return QString::number(seconds / 86400) + " д " + QString::number((seconds / 3600) % 24) + " ч";
+}
+Health currentHealth(const Snapshot& snapshot, int interval) {
+    return !snapshot.at.isValid() ||
+                   snapshot.at.secsTo(QDateTime::currentDateTimeUtc()) > qMax(90, interval * 3)
+               ? Health::Unknown
+               : snapshot.health;
 }
 QFrame* card(QWidget* parent = nullptr) {
     auto* f = new QFrame(parent);
@@ -174,6 +213,7 @@ QString appStyle() {
     QPushButton[role='primary']:hover { background: #71b2ff; }
     QPushButton[role='primary']:disabled { background: #233c5b; border-color: #2a4462; color: #8e9db0; }
     QPushButton[role='danger'] { color: #f28798; border-color: #5a3543; }
+    QPushButton[role='danger']:disabled { color: #76545c; border-color: #382b37; }
     QPushButton[role='nav'] { background: transparent; border: 0; text-align: left; padding: 13px 16px; color: #99a7ba; font-size: 15px; }
     QPushButton[role='nav']:hover { background: #192434; }
     QPushButton[role='nav'][active='true'] { background: #203651; color: #83bdff; font-weight: 600; }
@@ -192,6 +232,11 @@ QString appStyle() {
     QScrollBar::handle:horizontal { background: #354358; min-width: 30px; border-radius: 4px; }
     QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
     QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
+    QSplitter::handle { background: #26374b; border-radius: 3px; }
+    QSplitter::handle:hover { background: #4c9dff; }
+    QTabWidget::pane { border: 0; }
+    QTabBar::tab { background: #151f2c; color: #95a9c1; padding: 9px 18px; margin-right: 4px; border-radius: 5px; }
+    QTabBar::tab:selected { background: #203651; color: #83bdff; }
     QDialog { background: #151d29; }
     QCheckBox { background: transparent; spacing: 8px; }
     QCheckBox::indicator { width: 17px; height: 17px; border: 1px solid #53647d; border-radius: 3px; background: #111923; }
@@ -226,8 +271,11 @@ MainWindow::MainWindow(QString dataDirectory, bool demo)
     navigate(0);
     pollTimer_.setInterval(pollSeconds_ * 1000);
     connect(&pollTimer_, &QTimer::timeout, this, [this] {
-        if (!demo_)
+        if (!demo_) {
             poll();
+            if (pages_->currentIndex() == 2 && !mutating_)
+                fetchInventories();
+        }
     });
     pollTimer_.start();
     if (demo)
@@ -246,6 +294,24 @@ MainWindow::~MainWindow() {
     provisioner_ = nullptr;
     qDeleteAll(apis_);
     apis_.clear();
+    if (!demo_) {
+        QSettings settings(QDir(dataDirectory_).filePath("settings.ini"), QSettings::IniFormat);
+        for (auto* splitter : splitters_)
+            settings.setValue("layout/" + splitter->objectName(), splitter->saveState());
+    }
+}
+
+void MainWindow::configureSplitter(QSplitter* splitter, const QString& name,
+                                   const QList<int>& sizes) {
+    splitter->setObjectName(name);
+    splitter->setHandleWidth(8);
+    splitter->setChildrenCollapsible(false);
+    splitter->setSizes(sizes);
+    QSettings settings(QDir(dataDirectory_).filePath("settings.ini"), QSettings::IniFormat);
+    const auto saved = settings.value("layout/" + name).toByteArray();
+    if (!saved.isEmpty())
+        splitter->restoreState(saved);
+    splitters_.append(splitter);
 }
 
 void MainWindow::buildUi() {
@@ -280,7 +346,7 @@ void MainWindow::buildUi() {
     connect(demoButton_, &QPushButton::clicked, this, [this] { setDemo(!demo_); });
     side->addSpacing(16);
     side->addWidget(label("C++ / Qt  ·  Windows", "muted"));
-    side->addWidget(label("Локальная история · v0.2", "muted"));
+    side->addWidget(label("Локальная история · v0.3", "muted"));
     frame->addWidget(sidebar);
     auto* main = new QWidget;
     auto* layout = new QVBoxLayout(main);
@@ -349,11 +415,18 @@ QWidget* MainWindow::overviewPage() {
     auto* content = new QWidget;
     auto* root = new QVBoxLayout(content);
     root->setContentsMargins(28, 24, 28, 24);
-    root->setSpacing(18);
+    root->setSpacing(14);
     auto* meta = new QHBoxLayout;
     meta->addWidget(label("СОСТОЯНИЕ ВАШЕЙ СЕТИ", "eyebrow"));
     meta->addStretch();
-    meta->addWidget(label("Период", "muted"));
+    overviewServerFilter_ = new QComboBox;
+    overviewServerFilter_->setMinimumWidth(180);
+    overviewServerFilter_->addItem("Все серверы", "");
+    meta->addWidget(overviewServerFilter_);
+    connect(overviewServerFilter_, &QComboBox::currentIndexChanged, this, [this] {
+        refreshCharts();
+        refreshHealth();
+    });
     rangeCombo_ = new QComboBox;
     rangeCombo_->addItem("8 часов", 8);
     rangeCombo_->addItem("24 часа", 24);
@@ -370,81 +443,94 @@ QWidget* MainWindow::overviewPage() {
     root->addLayout(meta);
     auto* metrics = new QHBoxLayout;
     metrics->setSpacing(14);
-    const QStringList names = {"СЕРВЕРЫ", "КЛИЕНТОВ ОНЛАЙН", "ВХОДЯЩИЙ ТРАФИК",
-                               "СРЕДНЯЯ НАГРУЗКА CPU"};
+    const QStringList names = {"СЕРВЕРЫ", "УНИКАЛЬНЫЕ ПОДПИСКИ", "КЛИЕНТЫ ОНЛАЙН",
+                               "СЕТЕВОЙ ТРАФИК"};
     for (const auto& name : names) {
-        auto* f = card();
-        auto* l = new QVBoxLayout(f);
-        l->setContentsMargins(20, 16, 20, 16);
-        l->setSpacing(8);
-        l->addWidget(label(name, "eyebrow"));
+        auto* frame = card();
+        auto* layout = new QVBoxLayout(frame);
+        layout->setContentsMargins(18, 14, 18, 14);
+        layout->setSpacing(7);
+        layout->addWidget(label(name, "eyebrow"));
         auto* value = label("—", "value");
         metricValues_.append(value);
-        l->addWidget(value);
+        layout->addWidget(value);
         auto* detail = label("Нет измерений", "muted");
+        detail->setWordWrap(true);
         metricDetails_.append(detail);
-        l->addWidget(detail);
-        metrics->addWidget(f, 1);
+        layout->addWidget(detail);
+        metrics->addWidget(frame, 1);
     }
     root->addLayout(metrics);
+    resourceStats_ = label("CPU · RAM · диск · отклик: нет измерений", "muted");
+    resourceStats_->setWordWrap(true);
+    root->addWidget(resourceStats_);
+    auto* vertical = new QSplitter(Qt::Vertical);
     auto* health = card();
-    auto* hl = new QVBoxLayout(health);
-    hl->setContentsMargins(20, 17, 20, 15);
-    hl->setSpacing(10);
+    health->setMinimumHeight(160);
+    auto* healthLayout = new QVBoxLayout(health);
+    healthLayout->setContentsMargins(18, 14, 18, 12);
+    healthLayout->setSpacing(8);
     auto* head = new QHBoxLayout;
     head->addWidget(label("Доступность серверов", "section"));
     head->addStretch();
-    head->addWidget(
-        label("Зелёный — работает   ·   Жёлтый — Xray   ·   Красный — нет связи", "muted"));
-    hl->addLayout(head);
+    head->addWidget(label("Размер блоков меняется перетаскиванием разделителя", "muted"));
+    healthLayout->addLayout(head);
     auto* healthContent = new QWidget;
     healthRows_ = new QVBoxLayout(healthContent);
     healthRows_->setContentsMargins(0, 0, 0, 0);
     healthRows_->setSpacing(6);
     auto* area = scrollArea(healthContent);
-    area->setMinimumHeight(100);
-    area->setMaximumHeight(320);
-    hl->addWidget(area);
-    auto* timeline = new QHBoxLayout;
-    timeline->addWidget(label("Серые интервалы: измерений нет", "muted"));
-    timeline->addStretch();
-    timeline->addWidget(
-        label("Начало периода                                            Сейчас", "muted"));
-    hl->addLayout(timeline);
-    root->addWidget(health);
-    auto* charts = new QHBoxLayout;
-    charts->setSpacing(16);
-    for (int i = 0; i < 2; ++i) {
-        auto* f = card();
-        auto* l = new QVBoxLayout(f);
-        l->setContentsMargins(17, 17, 17, 12);
-        l->setSpacing(7);
-        l->addWidget(label(i == 0 ? "Клиенты онлайн" : "Сетевой трафик", "section"));
-        l->addWidget(label(i == 0 ? "По доступным измерениям всех серверов"
-                                  : "Приём  ·  синий     Передача  ·  зелёный",
-                           "muted"));
-        auto* chart =
-            new ChartWidget(i == 0 ? ChartWidget::Kind::Online : ChartWidget::Kind::Bandwidth);
-        if (i == 0)
-            onlineChart_ = chart;
-        else
-            trafficChart_ = chart;
-        l->addWidget(chart, 1);
-        charts->addWidget(f, 1);
+    area->setMinimumHeight(60);
+    healthLayout->addWidget(area, 1);
+    healthLayout->addWidget(
+        label("Зелёный — работает · жёлтый — Xray · красный — нет связи · серый — нет измерений",
+              "muted"));
+    vertical->addWidget(health);
+    auto* tabs = new QTabWidget;
+    tabs->setObjectName("statisticsTabs");
+    for (int tab = 0; tab < 2; ++tab) {
+        auto* horizontal = new QSplitter(Qt::Horizontal);
+        for (int column = 0; column < 2; ++column) {
+            int index = tab * 2 + column;
+            auto* frame = card();
+            auto* layout = new QVBoxLayout(frame);
+            layout->setContentsMargins(17, 15, 17, 12);
+            layout->setSpacing(7);
+            const QStringList titles = {"Клиенты онлайн", "Сетевой трафик", "Нагрузка CPU и RAM",
+                                        "Отклик API панели"};
+            layout->addWidget(label(titles[index], "section"));
+            auto* scope =
+                label(index == 1   ? "Приём · синий     Передача · зелёный"
+                      : index == 2 ? "CPU · синий     RAM · зелёный · среднее по выбранным серверам"
+                      : index == 3 ? "Среднее по выбранным серверам, в миллисекундах"
+                                   : "",
+                      "muted");
+            scope->setWordWrap(true);
+            layout->addWidget(scope);
+            const ChartWidget::Kind kinds[] = {
+                ChartWidget::Kind::Online, ChartWidget::Kind::Bandwidth, ChartWidget::Kind::Percent,
+                ChartWidget::Kind::Latency};
+            auto* chart = new ChartWidget(kinds[index]);
+            chart->setMinimumHeight(140);
+            if (index == 0) {
+                onlineChart_ = chart;
+                onlineChartScope_ = scope;
+            }
+            if (index == 1)
+                trafficChart_ = chart;
+            if (index == 2)
+                resourceChart_ = chart;
+            if (index == 3)
+                latencyChart_ = chart;
+            layout->addWidget(chart, 1);
+            horizontal->addWidget(frame);
+        }
+        configureSplitter(horizontal, tab == 0 ? "networkCharts" : "resourceCharts", {500, 500});
+        tabs->addTab(horizontal, tab == 0 ? "Онлайн и трафик" : "CPU, RAM и отклик");
     }
-    root->addLayout(charts);
-    auto* actions = card();
-    auto* al = new QHBoxLayout(actions);
-    al->setContentsMargins(20, 14, 20, 14);
-    auto* texts = new QVBoxLayout;
-    texts->addWidget(label("Все подписки в одном месте", "section"));
-    texts->addWidget(label("Создание, срок действия, лимиты трафика и состояние клиента", "muted"));
-    al->addLayout(texts, 1);
-    auto* go = button("Открыть подписки");
-    al->addWidget(go);
-    connect(go, &QPushButton::clicked, this, [this] { navigate(2); });
-    root->addWidget(actions);
-    root->addStretch();
+    vertical->addWidget(tabs);
+    configureSplitter(vertical, "overviewSections", {280, 340});
+    root->addWidget(vertical, 1);
     return scrollArea(content);
 }
 
@@ -455,7 +541,9 @@ QWidget* MainWindow::serversPage() {
     l->setSpacing(16);
     auto* toolbar = new QHBoxLayout;
     serverSearch_ = new QLineEdit;
+    serverSearch_->setObjectName("serverSearch");
     serverSearch_->setPlaceholderText("Поиск по имени, адресу или расположению");
+    serverSearch_->setClearButtonEnabled(true);
     toolbar->addWidget(serverSearch_, 1);
     connect(serverSearch_, &QLineEdit::textChanged, this, &MainWindow::refreshServersTable);
     auto* edit = button("Изменить");
@@ -467,9 +555,39 @@ QWidget* MainWindow::serversPage() {
     connect(edit, &QPushButton::clicked, this, &MainWindow::editServer);
     connect(remove, &QPushButton::clicked, this, &MainWindow::removeServer);
     l->addLayout(toolbar);
+    auto* filters = new QHBoxLayout;
+    serverHealthFilter_ = new QComboBox;
+    serverHealthFilter_->setObjectName("serverHealthFilter");
+    serverHealthFilter_->addItem("Любое состояние", -1);
+    for (int health = 0; health < 4; ++health)
+        serverHealthFilter_->addItem(healthName(Health(health)), health);
+    serverLocationFilter_ = new QComboBox;
+    serverLocationFilter_->setObjectName("serverLocationFilter");
+    serverLocationFilter_->addItem("Все расположения", "");
+    serverSort_ = new QComboBox;
+    serverSort_->setObjectName("serverSort");
+    serverSort_->addItems({"По имени", "Больше CPU", "Больше RAM", "Быстрее отклик"});
+    for (auto* combo : {serverHealthFilter_, serverLocationFilter_, serverSort_}) {
+        filters->addWidget(combo, 1);
+        connect(combo, &QComboBox::currentIndexChanged, this, &MainWindow::refreshServersTable);
+    }
+    auto* clear = button("Сбросить фильтры");
+    filters->addWidget(clear);
+    connect(clear, &QPushButton::clicked, this, [this] {
+        const QSignalBlocker a(serverSearch_), b(serverHealthFilter_), c(serverLocationFilter_),
+            d(serverSort_);
+        serverSearch_->clear();
+        serverHealthFilter_->setCurrentIndex(0);
+        serverLocationFilter_->setCurrentIndex(0);
+        serverSort_->setCurrentIndex(0);
+        refreshServersTable();
+    });
+    l->addLayout(filters);
     serverTable_ = table({"СЕРВЕР / РАСПОЛОЖЕНИЕ", "СТАТУС", "CPU", "RAM", "ДИСК", "ОНЛАЙН",
-                          "ОТКЛИК", "ВЕРСИЯ 3X-UI"});
-    serverTable_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+                          "ОТКЛИК", "ПРИЁМ / ПЕРЕДАЧА", "UPTIME", "ДОСТУПНОСТЬ", "ВЕРСИЯ 3X-UI"});
+    serverTable_->setObjectName("serversTable");
+    serverTable_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Interactive);
+    serverTable_->setColumnWidth(0, 260);
     connect(serverTable_, &QTableWidget::itemDoubleClicked, this, [this] { editServer(); });
     l->addWidget(serverTable_, 1);
     auto* operations = new QHBoxLayout;
@@ -506,23 +624,42 @@ QWidget* MainWindow::serversPage() {
     connect(backup, &QPushButton::clicked, this, &MainWindow::backupServer);
     connect(restore, &QPushButton::clicked, this, &MainWindow::restoreServer);
     l->addLayout(backups);
-    l->addWidget(
-        label("Выберите сервер для действий. Удаление подключения сохраняет клиентов на сервере.",
-              "muted"));
+    serverStatus_ = label("", "muted");
+    serverStatus_->setWordWrap(true);
+    l->addWidget(serverStatus_);
     return page;
 }
 
 QWidget* MainWindow::clientsPage() {
     auto* page = new QWidget;
-    auto* l = new QVBoxLayout(page);
-    l->setContentsMargins(28, 24, 28, 24);
-    l->setSpacing(14);
+    auto* layout = new QVBoxLayout(page);
+    layout->setContentsMargins(28, 24, 28, 24);
+    layout->setSpacing(12);
+    auto* stats = new QHBoxLayout;
+    const QStringList titles = {"УНИКАЛЬНЫЕ ПОДПИСКИ", "АКТИВНЫЕ / ОНЛАЙН", "ИСТЕКАЮТ ЗА 7 ДНЕЙ",
+                                "ТРАФИК ПОДПИСОК"};
+    for (const auto& title : titles) {
+        auto* frame = card();
+        auto* item = new QVBoxLayout(frame);
+        item->setContentsMargins(14, 10, 14, 10);
+        auto* caption = label(title, "eyebrow");
+        caption->setWordWrap(true);
+        item->addWidget(caption);
+        auto* value = label("—", "section");
+        subscriptionValues_.append(value);
+        item->addWidget(value);
+        stats->addWidget(frame, 1);
+    }
+    layout->addLayout(stats);
     auto* filters = new QHBoxLayout;
     clientSearch_ = new QLineEdit;
-    clientSearch_->setPlaceholderText("Найти подписку по имени клиента или серверу");
+    clientSearch_->setObjectName("subscriptionSearch");
+    clientSearch_->setPlaceholderText("Поиск по клиенту или связанному серверу");
+    clientSearch_->setClearButtonEnabled(true);
     filters->addWidget(clientSearch_, 1);
     serverFilter_ = new QComboBox;
-    serverFilter_->setMinimumWidth(180);
+    serverFilter_->setObjectName("subscriptionServerFilter");
+    serverFilter_->setMinimumWidth(160);
     serverFilter_->addItem("Все серверы", "");
     filters->addWidget(serverFilter_);
     auto* load = button("Загрузить клиентов");
@@ -530,21 +667,59 @@ QWidget* MainWindow::clientsPage() {
     connect(load, &QPushButton::clicked, this, &MainWindow::fetchInventories);
     connect(serverFilter_, &QComboBox::currentIndexChanged, this, &MainWindow::refreshClientsTable);
     connect(clientSearch_, &QLineEdit::textChanged, this, &MainWindow::refreshClientsTable);
-    l->addLayout(filters);
+    layout->addLayout(filters);
+    auto* advanced = new QHBoxLayout;
+    clientStateFilter_ = new QComboBox;
+    clientStateFilter_->setObjectName("subscriptionStateFilter");
+    clientStateFilter_->addItem("Все состояния", -1);
+    for (int i = 0; i < 6; ++i)
+        clientStateFilter_->addItem(stateText(SubscriptionState(i)), i);
+    clientStateFilter_->addItem("Онлайн", 6);
+    clientProtocolFilter_ = new QComboBox;
+    clientProtocolFilter_->setObjectName("subscriptionProtocolFilter");
+    clientProtocolFilter_->addItem("Все протоколы", "");
+    clientExpiryFilter_ = new QComboBox;
+    clientExpiryFilter_->setObjectName("subscriptionExpiryFilter");
+    clientExpiryFilter_->addItems({"Любой срок", "Без срока", "Истекают за 7 дней", "Срок истёк"});
+    clientSort_ = new QComboBox;
+    clientSort_->setObjectName("subscriptionSort");
+    clientSort_->addItems({"По имени", "Больше трафика", "Ближайший срок", "Больше серверов"});
+    for (auto* combo :
+         {clientStateFilter_, clientProtocolFilter_, clientExpiryFilter_, clientSort_}) {
+        advanced->addWidget(combo, 1);
+        connect(combo, &QComboBox::currentIndexChanged, this, &MainWindow::refreshClientsTable);
+    }
+    auto* clear = button("Сбросить");
+    clear->setObjectName("clearSubscriptionFilters");
+    advanced->addWidget(clear);
+    connect(clear, &QPushButton::clicked, this, [this] {
+        const QSignalBlocker a(clientSearch_), b(serverFilter_), c(clientStateFilter_),
+            d(clientProtocolFilter_), e(clientExpiryFilter_), f(clientSort_);
+        clientSearch_->clear();
+        for (auto* combo : {serverFilter_, clientStateFilter_, clientProtocolFilter_,
+                            clientExpiryFilter_, clientSort_})
+            combo->setCurrentIndex(0);
+        refreshClientsTable();
+    });
+    layout->addLayout(advanced);
     auto* toolbar = new QHBoxLayout;
-    auto* create = button("+ Создать подписку", "primary");
+    auto* create = button("+ Создать", "primary");
+    create->setToolTip("Создать подписку на выбранных серверах и инбаундах");
+    create->setAccessibleName("Создать подписку");
     auto* edit = button("Изменить");
-    auto* renew = button("Продлить на 30 дней");
-    auto* toggle = button("Включить / выключить");
+    auto* renew = button("+30 дней");
+    auto* toggle = button("Вкл. / выкл.");
+    toggle->setToolTip("Включить или выключить выбранную подписку");
+    toggle->setAccessibleName("Включить / выключить подписку");
     auto* reset = button("Сбросить трафик");
     auto* remove = button("Удалить", "danger");
-    for (auto* b : {create, edit, renew, toggle, reset, remove}) {
-        b->setProperty("allowPolling", true);
-        toolbar->addWidget(b);
-        writeButtons_.append(b);
+    for (auto* action : {create, edit, renew, toggle, reset, remove}) {
+        action->setProperty("allowPolling", true);
+        toolbar->addWidget(action);
+        writeButtons_.append(action);
     }
     toolbar->addStretch();
-    l->addLayout(toolbar);
+    layout->addLayout(toolbar);
     connect(create, &QPushButton::clicked, this, [this] { editClient(true); });
     connect(edit, &QPushButton::clicked, this, [this] { editClient(false); });
     connect(renew, &QPushButton::clicked, this, &MainWindow::renewClient);
@@ -553,21 +728,61 @@ QWidget* MainWindow::clientsPage() {
     connect(remove, &QPushButton::clicked, this, &MainWindow::deleteClient);
     masterStatus_ = label("", "muted");
     masterStatus_->setWordWrap(true);
-    l->addWidget(masterStatus_);
-    clientTable_ = table({"КЛИЕНТ", "СЕРВЕР", "ИНБАУНДЫ", "ПРОТОКОЛ", "СОСТОЯНИЕ", "ТРАФИК / ЛИМИТ",
+    layout->addWidget(masterStatus_);
+    auto* split = new QSplitter(Qt::Vertical);
+    clientTable_ = table({"КЛИЕНТ", "СВЯЗАННЫЕ СЕРВЕРЫ", "ПРОТОКОЛЫ", "СОСТОЯНИЕ", "ТРАФИК / ЛИМИТ",
                           "ДЕЙСТВУЕТ ДО"});
-    clientTable_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
-    l->addWidget(clientTable_, 1);
+    clientTable_->setObjectName("subscriptionsTable");
+    clientTable_->setMinimumHeight(130);
+    clientTable_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Interactive);
+    clientTable_->setColumnWidth(0, 170);
+    clientTable_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Interactive);
+    clientTable_->setColumnWidth(1, 180);
+    clientTable_->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Interactive);
+    clientTable_->setColumnWidth(2, 180);
+    split->addWidget(clientTable_);
+    auto* detail = card();
+    detail->setMinimumHeight(200);
+    auto* detailLayout = new QVBoxLayout(detail);
+    detailLayout->setContentsMargins(14, 10, 14, 10);
+    auto* head = new QHBoxLayout;
+    clientDetail_ = label("Выберите подписку, чтобы увидеть связанные серверы", "muted");
+    clientDetail_->setWordWrap(true);
+    head->addWidget(clientDetail_, 1);
+    head->addWidget(label("Действия через панель:", "muted"));
+    clientActionServer_ = new QComboBox;
+    clientActionServer_->setObjectName("clientActionServer");
+    clientActionServer_->setMinimumWidth(160);
+    head->addWidget(clientActionServer_);
+    detailLayout->addLayout(head);
+    clientNodesTable_ = table({"СЕРВЕР", "СВЯЗЬ", "КЛИЕНТ", "ТРАФИК / ЛИМИТ", "ДЕЙСТВУЕТ ДО"});
+    clientNodesTable_->setObjectName("subscriptionNodesTable");
+    clientNodesTable_->verticalHeader()->setDefaultSectionSize(36);
+    clientNodesTable_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Interactive);
+    clientNodesTable_->setColumnWidth(0, 240);
+    detailLayout->addWidget(clientNodesTable_, 1);
+    split->addWidget(detail);
+    configureSplitter(split, "subscriptionDetails", {360, 240});
+    layout->addWidget(split, 1);
+    connect(clientTable_, &QTableWidget::itemSelectionChanged, this,
+            &MainWindow::refreshClientDetails);
     connect(clientTable_, &QTableWidget::itemDoubleClicked, this, [this] { editClient(false); });
+    connect(clientNodesTable_, &QTableWidget::itemDoubleClicked, this,
+            [this](QTableWidgetItem* item) {
+                if (auto* identity = clientNodesTable_->item(item->row(), 0))
+                    clientActionServer_->setCurrentIndex(
+                        clientActionServer_->findData(identity->data(Qt::UserRole)));
+            });
     auto* footer = new QHBoxLayout;
     clientStatus_ = label("Клиенты ещё не загружены", "muted");
+    clientStatus_->setObjectName("subscriptionCount");
     clientStatus_->setWordWrap(true);
     footer->addWidget(clientStatus_, 1);
     auto* copy = button("Копировать ссылку подписки");
     footer->addWidget(copy);
     connect(copy, &QPushButton::clicked, this, &MainWindow::copySubscriptionLink);
-    l->addLayout(footer);
-    return page;
+    layout->addLayout(footer);
+    return scrollArea(page);
 }
 
 QWidget* MainWindow::eventsPage() {
@@ -636,7 +851,7 @@ QWidget* MainWindow::settingsPage() {
         QSettings settings(QDir(dataDirectory_).filePath("settings.ini"), QSettings::IniFormat);
         settings.setValue("masterServerId", masterServerId_);
         settings.sync();
-        refreshMasterSelector();
+        refreshUi();
         report(settings.status() == QSettings::NoError ? "Мастер-нода сохранена."
                                                        : "Не удалось сохранить мастер-ноду.",
                settings.status() != QSettings::NoError);
@@ -731,9 +946,12 @@ void MainWindow::refreshMasterSelector() {
                                      " · общая ссылка использует её адрес выдачи подписок.");
 }
 void MainWindow::copySubscriptionLink() {
-    auto client = selectedClient();
-    if (!client)
+    const int row = clientTable_->currentRow();
+    if (row < 0 || row >= visibleSubscriptions_.size()) {
+        report("Сначала выберите подписку в списке.");
         return;
+    }
+    const auto client = std::optional<Client>(visibleSubscriptions_[row].primary());
     const QString master = activeMasterServerId();
     const QString id = master.isEmpty() ? client->serverId : master;
     if (!master.isEmpty() && client->serverId != master) {
@@ -828,34 +1046,65 @@ void MainWindow::reloadData() {
 }
 
 void MainWindow::refreshUi() {
-    int onlineServers = 0, warnings = 0;
-    int clientsOnline = 0, cpuCount = 0, onlineCount = 0, rxCount = 0;
-    double cpu = 0, rx = 0, tx = 0;
+    for (auto* combo : {serverFilter_, overviewServerFilter_}) {
+        const QString selected = combo->currentData().toString();
+        QSignalBlocker blocker(combo);
+        combo->clear();
+        combo->addItem("Все серверы", "");
+        for (const auto& server : servers_)
+            combo->addItem(server.name, server.id);
+        combo->setCurrentIndex(qMax(0, combo->findData(selected)));
+    }
+    {
+        const QString selected = serverLocationFilter_->currentData().toString();
+        QSignalBlocker blocker(serverLocationFilter_);
+        serverLocationFilter_->clear();
+        serverLocationFilter_->addItem("Все расположения", "");
+        QStringList locations;
+        for (const auto& server : servers_)
+            if (!server.location.isEmpty() && !locations.contains(server.location))
+                locations.append(server.location);
+        locations.sort();
+        for (const auto& location : locations)
+            serverLocationFilter_->addItem(location, location);
+        serverLocationFilter_->setCurrentIndex(qMax(0, serverLocationFilter_->findData(selected)));
+    }
+    refreshMasterSelector();
+    refreshClientsTable();
+    const auto stats = subscriptionStats(subscriptionGroups_, QDateTime::currentMSecsSinceEpoch());
+    int onlineServers = 0, warnings = 0, cpuCount = 0, ramCount = 0, rxCount = 0, txCount = 0;
+    double cpu = 0, ram = 0, rx = 0, tx = 0;
+    std::optional<double> disk;
+    QList<int> latencies;
     QDateTime recent;
-    for (const auto& s : servers_) {
-        auto snap = latest_.value(s.id);
-        if (snap.at.isValid() &&
-            snap.at.secsTo(QDateTime::currentDateTimeUtc()) > qMax(90, pollSeconds_ * 3))
-            snap.health = Health::Unknown;
-        if (snap.health == Health::Online)
+    for (const auto& server : servers_) {
+        const auto snap = latest_.value(server.id);
+        const auto health = currentHealth(snap, pollSeconds_);
+        if (health == Health::Online)
             ++onlineServers;
-        else if (snap.health == Health::Warning || snap.health == Health::Offline)
+        else if (health == Health::Warning || health == Health::Offline)
             ++warnings;
-        if (snap.health == Health::Online || snap.health == Health::Warning) {
-            if (snap.online) {
-                clientsOnline += *snap.online;
-                ++onlineCount;
-            }
+        if (health == Health::Online || health == Health::Warning) {
             if (snap.cpu) {
                 cpu += *snap.cpu;
                 ++cpuCount;
             }
+            if (snap.memoryPercent) {
+                ram += *snap.memoryPercent;
+                ++ramCount;
+            }
+            if (snap.diskPercent)
+                disk = qMax(disk.value_or(0), *snap.diskPercent);
             if (snap.rxBps) {
                 rx += *snap.rxBps;
                 ++rxCount;
             }
-            if (snap.txBps)
+            if (snap.txBps) {
                 tx += *snap.txBps;
+                ++txCount;
+            }
+            if (snap.latencyMs)
+                latencies.append(*snap.latencyMs);
         }
         if (snap.at > recent)
             recent = snap.at;
@@ -865,19 +1114,37 @@ void MainWindow::refreshUi() {
     metricDetails_[0]->setText(servers_.isEmpty()
                                    ? "Подключите первый сервер"
                                    : QString::number(warnings) + " требуют внимания");
-    metricValues_[1]->setText(onlineCount ? QString::number(clientsOnline) : "—");
-    metricDetails_[1]->setText(onlineCount ? "Данные " + QString::number(onlineCount) + " из " +
-                                                 QString::number(servers_.size()) + " серверов"
-                                           : "Нет измерений онлайна");
-    metricValues_[2]->setText(rxCount ? bytes(rx, true) : "—");
-    metricDetails_[2]->setText(rxCount ? "Передача: " + bytes(tx, true) : "Нет измерений трафика");
-    metricValues_[3]->setText(cpuCount ? QString::number(cpu / cpuCount, 'f', 1) + " %" : "—");
-    metricDetails_[3]->setText(cpuCount ? "По " + QString::number(cpuCount) + " серверам"
-                                        : "Нет измерений нагрузки");
-    QString state = servers_.isEmpty() ? "Сеть не подключена"
-                    : warnings         ? QString::number(warnings) + " требуют внимания"
-                    : onlineServers == servers_.size() ? "Все серверы работают"
-                                                       : "Ожидаем измерения";
+    metricValues_[1]->setText(inventories_.isEmpty() ? "—" : QString::number(stats.total));
+    metricDetails_[1]->setText("Активны: " + QString::number(stats.active) +
+                               " · истекают: " + QString::number(stats.expiring));
+    metricValues_[2]->setText(stats.onlineKnown ? QString::number(stats.online) : "—");
+    metricDetails_[2]->setText("Онлайн известен для " + QString::number(stats.onlineKnown) +
+                               " из " + QString::number(stats.total));
+    metricValues_[3]->setText(rxCount ? bytes(rx, true) : "—");
+    metricDetails_[3]->setText(txCount ? "Передача: " + bytes(tx, true) : "Передача: нет данных");
+    std::sort(latencies.begin(), latencies.end());
+    double latency = 0;
+    for (const int value : latencies)
+        latency += value;
+    QString response = latencies.isEmpty()
+                           ? "—"
+                           : QString::number(latency / double(latencies.size()), 'f', 0) + " мс";
+    if (!latencies.isEmpty())
+        response += " · p95 " +
+                    QString::number(
+                        latencies[qMax(0, int(std::ceil(double(latencies.size()) * 0.95)) - 1)]) +
+                    " мс";
+    resourceStats_->setText(
+        "CPU: " + (cpuCount ? QString::number(cpu / cpuCount, 'f', 1) + " %" : "—") +
+        "   ·   RAM: " + (ramCount ? QString::number(ram / ramCount, 'f', 1) + " %" : "—") +
+        "   ·   Диск, максимум: " + percent(disk) + "   ·   Отклик панелей: " + response);
+    resourceStats_->setToolTip(
+        "CPU и RAM — среднее по доступным панелям. p95 — распределение последних откликов "
+        "серверов. Диск — максимальное заполнение среди доступных серверов.");
+    const QString state = servers_.isEmpty() ? "Сеть не подключена"
+                          : warnings         ? QString::number(warnings) + " требуют внимания"
+                          : onlineServers == servers_.size() ? "Все серверы работают"
+                                                             : "Ожидаем измерения";
     networkState_->setText(state);
     networkState_->setStyleSheet(QString("color:%1;")
                                      .arg(warnings            ? "#e6b950"
@@ -887,43 +1154,48 @@ void MainWindow::refreshUi() {
                         : recent.isValid()
                             ? "Последняя проверка " + recent.toLocalTime().toString("HH:mm:ss")
                             : "Проверка каждые " + QString::number(pollSeconds_) + " с");
-    const QString oldFilter = serverFilter_->currentData().toString();
-    serverFilter_->blockSignals(true);
-    serverFilter_->clear();
-    serverFilter_->addItem("Все серверы", "");
-    for (const auto& s : servers_)
-        serverFilter_->addItem(s.name, s.id);
-    int idx = serverFilter_->findData(oldFilter);
-    serverFilter_->setCurrentIndex(qMax(0, idx));
-    serverFilter_->blockSignals(false);
-    refreshMasterSelector();
     refreshServersTable();
-    refreshClientsTable();
     refreshEventsTable();
     refreshCharts();
     refreshHealth();
     setBusyUi();
 }
+
 void MainWindow::refreshServersTable() {
     const QString search = serverSearch_->text().trimmed();
+    const int filterHealth = serverHealthFilter_->currentData().toInt();
+    const QString location = serverLocationFilter_->currentData().toString();
+    QList<ServerConfig> ordered = servers_;
+    const int sort = serverSort_->currentIndex();
+    std::stable_sort(ordered.begin(), ordered.end(), [this, sort](const auto& a, const auto& b) {
+        const auto left = latest_.value(a.id), right = latest_.value(b.id);
+        if (sort == 1 && left.cpu != right.cpu)
+            return left.cpu.value_or(-1) > right.cpu.value_or(-1);
+        if (sort == 2 && left.memoryPercent != right.memoryPercent)
+            return left.memoryPercent.value_or(-1) > right.memoryPercent.value_or(-1);
+        if (sort == 3 && left.latencyMs != right.latencyMs)
+            return left.latencyMs.value_or(std::numeric_limits<int>::max()) <
+                   right.latencyMs.value_or(std::numeric_limits<int>::max());
+        return a.name.compare(b.name, Qt::CaseInsensitive) < 0;
+    });
     QString selected;
     int oldRow = serverTable_->currentRow();
     if (oldRow >= 0 && oldRow < visibleServers_.size())
         selected = visibleServers_[oldRow];
     visibleServers_.clear();
     serverTable_->setRowCount(0);
-    for (const auto& s : servers_) {
+    for (const auto& s : ordered) {
         if (!search.isEmpty() && !QString(s.name + " " + s.location + " " + s.panelUrl.host())
                                       .contains(search, Qt::CaseInsensitive))
+            continue;
+        const auto v = latest_.value(s.id);
+        const Health h = currentHealth(v, pollSeconds_);
+        if ((filterHealth >= 0 && int(h) != filterHealth) ||
+            (!location.isEmpty() && s.location != location))
             continue;
         int row = serverTable_->rowCount();
         serverTable_->insertRow(row);
         visibleServers_.append(s.id);
-        const auto v = latest_.value(s.id);
-        Health h = v.health;
-        if (!v.at.isValid() ||
-            v.at.secsTo(QDateTime::currentDateTimeUtc()) > qMax(90, pollSeconds_ * 3))
-            h = Health::Unknown;
         cell(serverTable_, row, 0, {}, QColor("#e4edf8"),
              s.name + "\n" + s.location + " · " + s.panelUrl.host());
         auto* info = new QWidget;
@@ -942,100 +1214,240 @@ void MainWindow::refreshServersTable() {
         cell(serverTable_, row, 4, percent(v.diskPercent));
         cell(serverTable_, row, 5, v.online ? QString::number(*v.online) : "—");
         cell(serverTable_, row, 6, v.latencyMs ? QString::number(*v.latencyMs) + " мс" : "—");
-        cell(serverTable_, row, 7, v.panelVersion.isEmpty() ? "—" : v.panelVersion);
+        cell(serverTable_, row, 7,
+             (v.rxBps ? bytes(*v.rxBps, true) : "—") + " / " +
+                 (v.txBps ? bytes(*v.txBps, true) : "—"),
+             QColor("#e4edf8"),
+             "С момента запуска: приём " +
+                 (v.receivedBytes ? bytes(double(*v.receivedBytes)) : "—") + ", передача " +
+                 (v.sentBytes ? bytes(double(*v.sentBytes)) : "—"));
+        cell(serverTable_, row, 8, uptimeText(v.uptimeSeconds), QColor("#93a4bb"),
+             "Xray " + v.xrayVersion);
+        const auto from = QDateTime::currentDateTimeUtc().addSecs(-rangeHours_ * 3600);
+        int measured = 0, healthy = 0;
+        for (const auto& snapshot : history_)
+            if (snapshot.serverId == s.id && snapshot.at >= from &&
+                snapshot.health != Health::Unknown) {
+                ++measured;
+                healthy += snapshot.health == Health::Online;
+            }
+        cell(serverTable_, row, 9,
+             measured ? QString::number(100.0 * healthy / measured, 'f', 1) + " %" : "—",
+             QColor("#93a4bb"),
+             "Успешные проверки за " + QString::number(rangeHours_) +
+                 " ч. Без периодов, когда приложение не собирало данные.");
+        cell(serverTable_, row, 10, v.panelVersion.isEmpty() ? "—" : v.panelVersion);
         if (s.id == selected)
             serverTable_->selectRow(row);
     }
+    serverStatus_->setText(QString::number(visibleServers_.size()) + " из " +
+                           QString::number(servers_.size()) + " серверов · доступность за " +
+                           QString::number(rangeHours_) +
+                           " ч · выберите строку для управления и бэкапа");
 }
 void MainWindow::refreshClientsTable() {
     if (!clientTable_)
         return;
-    const QString search = clientSearch_->text().trimmed(),
-                  filter = serverFilter_->currentData().toString();
     QString selected;
-    const int selectedRow = clientTable_->currentRow();
-    if (selectedRow >= 0 && selectedRow < visibleClients_.size())
-        selected = visibleClients_[selectedRow].serverId + "|" + visibleClients_[selectedRow].email;
-    visibleClients_.clear();
-    clientTable_->setRowCount(0);
-    int total = 0;
-    for (const auto& s : servers_)
-        for (const auto& c : inventories_.value(s.id).clients) {
-            ++total;
-            if (!filter.isEmpty() && c.serverId != filter)
-                continue;
-            if (!search.isEmpty() &&
-                !QString(c.email + " " + s.name).contains(search, Qt::CaseInsensitive))
-                continue;
+    const int oldRow = clientTable_->currentRow();
+    if (oldRow >= 0 && oldRow < visibleSubscriptions_.size())
+        selected = visibleSubscriptions_[oldRow].key;
+    auto observations = inventories_;
+    for (auto it = observations.begin(); it != observations.end(); ++it) {
+        const auto snap = latest_.value(it.key());
+        const auto health = currentHealth(snap, pollSeconds_);
+        for (auto& client : it->clients) {
+            if (health == Health::Offline || health == Health::Unknown)
+                client.online.reset();
+            else if (snap.onlineDetailsAvailable)
+                client.online = snap.onlineEmails.contains(client.email);
+        }
+    }
+    subscriptionGroups_ = groupSubscriptions(servers_, observations, activeMasterServerId());
+    QStringList protocols;
+    QHash<QString, QString> names;
+    for (const auto& server : servers_)
+        names.insert(server.id, server.name);
+    for (const auto& group : subscriptionGroups_)
+        for (const auto& protocol : group.protocols)
+            if (!protocols.contains(protocol))
+                protocols.append(protocol);
+    protocols.sort();
+    const QString oldProtocol = clientProtocolFilter_->currentData().toString();
+    {
+        QSignalBlocker blocker(clientProtocolFilter_);
+        clientProtocolFilter_->clear();
+        clientProtocolFilter_->addItem("Все протоколы", "");
+        for (const auto& protocol : protocols)
+            clientProtocolFilter_->addItem(protocolText(protocol), protocol);
+        clientProtocolFilter_->setCurrentIndex(
+            qMax(0, clientProtocolFilter_->findData(oldProtocol)));
+    }
+    SubscriptionFilter filter{clientSearch_->text(), serverFilter_->currentData().toString(),
+                              clientProtocolFilter_->currentData().toString(),
+                              clientStateFilter_->currentData().toInt(),
+                              clientExpiryFilter_->currentIndex()};
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    visibleSubscriptions_.clear();
+    for (const auto& group : subscriptionGroups_)
+        if (matchesSubscription(group, filter, names, now))
+            visibleSubscriptions_.append(group);
+    const int sort = clientSort_->currentIndex();
+    std::stable_sort(visibleSubscriptions_.begin(), visibleSubscriptions_.end(),
+                     [sort](const auto& a, const auto& b) {
+                         if (sort == 1 && a.primary().usedBytes != b.primary().usedBytes)
+                             return a.primary().usedBytes > b.primary().usedBytes;
+                         if (sort == 2) {
+                             const qint64 aExpiry = a.primary().expiryTime > 0
+                                                        ? a.primary().expiryTime
+                                                        : std::numeric_limits<qint64>::max();
+                             const qint64 bExpiry = b.primary().expiryTime > 0
+                                                        ? b.primary().expiryTime
+                                                        : std::numeric_limits<qint64>::max();
+                             if (aExpiry != bExpiry)
+                                 return aExpiry < bExpiry;
+                         }
+                         if (sort == 3 && a.serverIds.size() != b.serverIds.size())
+                             return a.serverIds.size() > b.serverIds.size();
+                         return a.email.compare(b.email, Qt::CaseInsensitive) < 0;
+                     });
+    {
+        QSignalBlocker blocker(clientTable_);
+        clientTable_->setRowCount(0);
+        int selectedRow = -1;
+        for (const auto& group : visibleSubscriptions_) {
             const int row = clientTable_->rowCount();
             clientTable_->insertRow(row);
-            visibleClients_.append(c);
-            cell(clientTable_, row, 0, c.email);
-            cell(clientTable_, row, 1, s.name);
-            QStringList bindings;
-            QStringList protocols;
-            for (int inboundId : c.inboundIds) {
-                QString description = "#" + QString::number(inboundId);
-                for (const auto& inbound : inventories_.value(s.id).inbounds)
-                    if (inbound.id == inboundId) {
-                        description +=
-                            " · " + inbound.remark + " · " + QString::number(inbound.port);
-                        const QString protocol = inbound.protocol.toUpper();
-                        if (!protocols.contains(protocol))
-                            protocols.append(protocol);
-                        break;
-                    }
-                bindings.append(description);
-            }
-            cell(clientTable_, row, 2,
-                 c.inboundIds.isEmpty() ? "Нет привязок" : QString::number(c.inboundIds.size()),
-                 QColor("#93a4bb"), bindings.join('\n'));
-            protocols.sort();
-            cell(clientTable_, row, 3,
-                 protocols.isEmpty() ? (c.protocol.isEmpty() ? "—" : c.protocol.toUpper())
-                                     : protocols.join(" / "));
-            QString state = "Активна";
-            QColor color("#46d8a9");
-            if (c.inboundIds.isEmpty()) {
-                state = "Нет инбаундов";
-                color = QColor("#e6b950");
-            } else if (!c.enable) {
-                state = "Отключена";
-                color = QColor("#8b99ac");
-            } else if (c.expiryTime > 0 && c.expiryTime < QDateTime::currentMSecsSinceEpoch()) {
-                state = "Истекла";
-                color = QColor("#e6b950");
-            } else if (c.totalBytes > 0 && c.usedBytes >= c.totalBytes) {
-                state = "Лимит исчерпан";
-                color = QColor("#e6b950");
-            } else if (c.online && *c.online)
-                state = "Онлайн";
-            cell(clientTable_, row, 4, state, color);
-            cell(clientTable_, row, 5,
-                 bytes(double(c.usedBytes)) + " / " +
-                     (c.totalBytes ? bytes(double(c.totalBytes)) : "∞"));
-            cell(clientTable_, row, 6,
-                 c.expiryTime == 0 ? "Без срока"
-                 : c.expiryTime < 0
-                     ? "После первого входа"
-                     : QDateTime::fromMSecsSinceEpoch(c.expiryTime).toString("dd.MM.yyyy HH:mm"));
-            if (c.serverId + "|" + c.email == selected)
-                clientTable_->selectRow(row);
+            const auto& client = group.primary();
+            cell(clientTable_, row, 0, group.email);
+            QStringList nodeNames;
+            for (const auto& id : group.serverIds)
+                nodeNames.append(serverName(id));
+            const QString nodeText = nodeNames.size() == 1
+                                         ? nodeNames.first()
+                                         : QString::number(nodeNames.size()) + " серверов";
+            cell(clientTable_, row, 1, nodeText, QColor("#93a4bb"), nodeNames.join('\n'));
+            QStringList protocolNames;
+            for (const auto& protocol : group.protocols)
+                protocolNames.append(protocolText(protocol));
+            cell(clientTable_, row, 2, protocolNames.join(" / "), QColor("#e4edf8"),
+                 protocolNames.join('\n'));
+            const auto state = group.state(now);
+            const QString text = state == SubscriptionState::Active && group.online.value_or(false)
+                                     ? "Онлайн"
+                                     : stateText(state);
+            const QColor color = state == SubscriptionState::Active     ? QColor("#46d8a9")
+                                 : state == SubscriptionState::Disabled ? QColor("#8b99ac")
+                                                                        : QColor("#e6b950");
+            cell(clientTable_, row, 3, text, color,
+                 group.settingsDiffer ? "Состояние, квота или срок различаются между серверами"
+                                      : "");
+            cell(clientTable_, row, 4,
+                 bytes(double(client.usedBytes)) + " / " +
+                     (client.totalBytes ? bytes(double(client.totalBytes)) : "∞"),
+                 QColor("#e4edf8"),
+                 "Источник счётчика: " + serverName(client.serverId) +
+                     ". Копии на других серверах не суммируются.");
+            cell(clientTable_, row, 5, expiryText(client.expiryTime));
+            if (group.key == selected)
+                selectedRow = row;
         }
-    QString status = QString::number(visibleClients_.size()) + " из " + QString::number(total) +
-                     " подписок · " + QString::number(inventories_.size()) + " из " +
+        if (selectedRow >= 0)
+            clientTable_->selectRow(selectedRow);
+        else if (selected.isEmpty() && !visibleSubscriptions_.isEmpty())
+            clientTable_->selectRow(0);
+    }
+    refreshClientDetails();
+    const auto stats = subscriptionStats(visibleSubscriptions_, now);
+    subscriptionValues_[0]->setText(QString::number(stats.total) + " / " +
+                                    QString::number(subscriptionGroups_.size()));
+    subscriptionValues_[1]->setText(QString::number(stats.active) + " / " +
+                                    (stats.onlineKnown ? QString::number(stats.online) : "—"));
+    subscriptionValues_[1]->setToolTip("Онлайн известен для " + QString::number(stats.onlineKnown) +
+                                       " из " + QString::number(stats.total) + " подписок.");
+    subscriptionValues_[2]->setText(QString::number(stats.expiring));
+    subscriptionValues_[3]->setText(bytes(double(stats.usedBytes)));
+    subscriptionValues_[3]->setToolTip("По мастер-ноде. Если её запись отсутствует, используется "
+                                       "первый загруженный сервер; копии не суммируются.");
+    int copies = 0;
+    for (const auto& group : subscriptionGroups_)
+        copies += static_cast<int>(group.members.size());
+    QString status = QString::number(visibleSubscriptions_.size()) + " из " +
+                     QString::number(subscriptionGroups_.size()) + " уникальных подписок · " +
+                     QString::number(copies) + " записей на серверах · " +
+                     QString::number(inventories_.size()) + " из " +
                      QString::number(servers_.size()) + " серверов загружены";
     if (inventoryPending_)
-        status = "Загрузка клиентов… " + QString::number(inventoryPending_) + " серверов";
-    else if (!inventoryErrors_.isEmpty()) {
+        status += " · Обновление: " + QString::number(inventoryPending_) + " серверов";
+    if (!inventoryErrors_.isEmpty()) {
         QStringList errors;
         for (auto it = inventoryErrors_.cbegin(); it != inventoryErrors_.cend(); ++it)
             errors << serverName(it.key()) + ": " + it.value();
-        status += " · Ошибки: " + errors.join("; ");
+        status += " · Последние сохранённые данные. Ошибки: " + errors.join("; ");
     }
     clientStatus_->setText(status);
     clientStatus_->setStyleSheet(inventoryErrors_.isEmpty() ? "color:#8b99ac;" : "color:#ef8d9d;");
 }
+
+void MainWindow::refreshClientDetails() {
+    if (!clientNodesTable_ || !clientActionServer_)
+        return;
+    const QString previousGroup = clientActionServer_->property("groupKey").toString();
+    const QString previousServer = clientActionServer_->currentData().toString();
+    const QSignalBlocker blocker(clientActionServer_);
+    clientActionServer_->clear();
+    clientNodesTable_->setRowCount(0);
+    const int row = clientTable_->currentRow();
+    if (row < 0 || row >= visibleSubscriptions_.size()) {
+        clientDetail_->setText("Выберите подписку, чтобы увидеть связанные серверы");
+        clientActionServer_->setProperty("groupKey", "");
+        clientActionServer_->setEnabled(false);
+        return;
+    }
+    const auto& group = visibleSubscriptions_[row];
+    clientDetail_->setText(group.email + " · " + QString::number(group.serverIds.size()) +
+                           " серверов · счётчик: " + serverName(group.primary().serverId));
+    clientActionServer_->setEnabled(!mutating_);
+    clientActionServer_->setProperty("groupKey", group.key);
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    for (const auto& id : group.serverIds) {
+        const auto member = std::find_if(group.members.cbegin(), group.members.cend(),
+                                         [&](const auto& client) { return client.serverId == id; });
+        if (member == group.members.cend())
+            continue;
+        const QString name =
+            serverName(id) +
+            (id == activeMasterServerId() && !serverName(id).contains("мастер", Qt::CaseInsensitive)
+                 ? " · мастер"
+                 : "");
+        clientActionServer_->addItem(name, id);
+        const int nodeRow = clientNodesTable_->rowCount();
+        clientNodesTable_->insertRow(nodeRow);
+        cell(clientNodesTable_, nodeRow, 0, name);
+        clientNodesTable_->item(nodeRow, 0)->setData(Qt::UserRole, id);
+        const auto snapshot = latest_.value(id);
+        const auto health = currentHealth(snapshot, pollSeconds_);
+        cell(clientNodesTable_, nodeRow, 1, healthName(health), healthColor(health),
+             snapshot.error);
+        SubscriptionGroup node;
+        node.members = {*member};
+        const auto state = node.state(now);
+        cell(clientNodesTable_, nodeRow, 2,
+             state == SubscriptionState::Active && member->online.value_or(false)
+                 ? "Онлайн"
+                 : stateText(state),
+             state == SubscriptionState::Active ? QColor("#46d8a9") : QColor("#e6b950"));
+        cell(clientNodesTable_, nodeRow, 3,
+             bytes(double(member->usedBytes)) + " / " +
+                 (member->totalBytes ? bytes(double(member->totalBytes)) : "∞"));
+        cell(clientNodesTable_, nodeRow, 4, expiryText(member->expiryTime));
+    }
+    const QString target = previousGroup == group.key ? previousServer : group.primary().serverId;
+    const int targetIndex = clientActionServer_->findData(target);
+    clientActionServer_->setCurrentIndex(
+        targetIndex >= 0 ? targetIndex : clientActionServer_->findData(group.primary().serverId));
+}
+
 void MainWindow::refreshEventsTable() {
     eventTable_->setRowCount(events_.size());
     for (int i = 0; i < events_.size(); ++i) {
@@ -1050,32 +1462,63 @@ void MainWindow::refreshEventsTable() {
 }
 void MainWindow::refreshCharts() {
     const QDateTime now = QDateTime::currentDateTimeUtc(), from = now.addSecs(-rangeHours_ * 3600);
+    const QString selected = overviewServerFilter_->currentData().toString();
+    const QString master = activeMasterServerId();
+    const QString onlineSource = !selected.isEmpty() ? selected : master;
+    onlineChartScope_->setText(
+        onlineSource.isEmpty()
+            ? "Сумма показаний панелей; один клиент может присутствовать на нескольких узлах"
+            : "Источник: " + serverName(onlineSource) + "; копии на других узлах не суммируются");
     QMap<qint64, QHash<QString, Snapshot>> buckets;
-    for (const auto& s : history_) {
-        if (s.at < from)
+    for (const auto& snapshot : history_) {
+        if (snapshot.at < from || snapshot.at > now ||
+            (!selected.isEmpty() && snapshot.serverId != selected))
             continue;
-        qint64 at = s.at.toMSecsSinceEpoch() / 60000 * 60000;
-        buckets[at][s.serverId] = s;
+        const qint64 at = snapshot.at.toMSecsSinceEpoch() / 60000 * 60000;
+        buckets[at][snapshot.serverId] = snapshot;
     }
-    QList<ChartPoint> online, traffic;
+    QList<ChartPoint> online, traffic, resources, latency;
     for (auto it = buckets.cbegin(); it != buckets.cend(); ++it) {
         std::optional<double> users, rx, tx;
-        for (const auto& s : it.value()) {
-            if (s.health != Health::Online && s.health != Health::Warning)
+        double cpu = 0, ram = 0, response = 0;
+        int cpuCount = 0, ramCount = 0, responseCount = 0;
+        for (const auto& snapshot : it.value()) {
+            if (snapshot.health != Health::Online && snapshot.health != Health::Warning)
                 continue;
-            if (s.online)
-                users = users.value_or(0) + *s.online;
-            if (s.rxBps)
-                rx = rx.value_or(0) + *s.rxBps;
-            if (s.txBps)
-                tx = tx.value_or(0) + *s.txBps;
+            if (snapshot.online && (onlineSource.isEmpty() || snapshot.serverId == onlineSource))
+                users = users.value_or(0) + *snapshot.online;
+            if (snapshot.rxBps)
+                rx = rx.value_or(0) + *snapshot.rxBps;
+            if (snapshot.txBps)
+                tx = tx.value_or(0) + *snapshot.txBps;
+            if (snapshot.cpu) {
+                cpu += *snapshot.cpu;
+                ++cpuCount;
+            }
+            if (snapshot.memoryPercent) {
+                ram += *snapshot.memoryPercent;
+                ++ramCount;
+            }
+            if (snapshot.latencyMs) {
+                response += *snapshot.latencyMs;
+                ++responseCount;
+            }
         }
         online.append({it.key(), users, {}});
         traffic.append({it.key(), rx, tx});
+        resources.append({it.key(), cpuCount ? std::optional<double>(cpu / cpuCount) : std::nullopt,
+                          ramCount ? std::optional<double>(ram / ramCount) : std::nullopt});
+        latency.append(
+            {it.key(),
+             responseCount ? std::optional<double>(response / responseCount) : std::nullopt,
+             {}});
     }
     onlineChart_->setPoints(online, from, now);
     trafficChart_->setPoints(traffic, from, now);
+    resourceChart_->setPoints(resources, from, now);
+    latencyChart_->setPoints(latency, from, now);
 }
+
 void MainWindow::refreshHealth() {
     clearLayout(healthRows_);
     const QDateTime now = QDateTime::currentDateTimeUtc(), from = now.addSecs(-rangeHours_ * 3600);
@@ -1094,6 +1537,9 @@ void MainWindow::refreshHealth() {
         return;
     }
     for (const auto& s : servers_) {
+        const QString filter = overviewServerFilter_->currentData().toString();
+        if (!filter.isEmpty() && s.id != filter)
+            continue;
         auto* row = new QWidget;
         auto* l = new QHBoxLayout(row);
         l->setContentsMargins(0, 8, 0, 8);
@@ -1126,7 +1572,8 @@ void MainWindow::refreshHealth() {
         for (const auto& snap : history_)
             if (snap.serverId == s.id && snap.at >= from) {
                 samples.append({snap.at.toMSecsSinceEpoch(), int(snap.health)});
-                ++total;
+                if (snap.health != Health::Unknown)
+                    ++total;
                 if (snap.health == Health::Online)
                     ++healthy;
             }
@@ -1271,12 +1718,29 @@ ServerConfig* MainWindow::selectedServer() {
 }
 std::optional<Client> MainWindow::selectedClient() {
     const int row = clientTable_->currentRow();
-    if (row < 0 || row >= visibleClients_.size()) {
+    if (row < 0 || row >= visibleSubscriptions_.size()) {
         report("Сначала выберите подписку в списке.");
         return {};
     }
-    return visibleClients_[row];
+    const auto& group = visibleSubscriptions_[row];
+    const auto server = clientActionServer_->currentData().toString();
+    std::optional<Client> selected;
+    for (const auto& member : group.members) {
+        if (member.serverId != server)
+            continue;
+        if (selected) {
+            report("В API v2 клиент представлен несколькими записями на этом сервере. Для "
+                   "изменения используйте 3x-ui.",
+                   true);
+            return {};
+        }
+        selected = member;
+    }
+    if (!selected)
+        report("Выберите панель для действия с подпиской.");
+    return selected;
 }
+
 void MainWindow::addServer() {
     if (!writable())
         return;
@@ -1485,7 +1949,8 @@ void MainWindow::renewClient() {
     const qint64 expiry = base + extension;
     if (!confirm(this, "Продлить подписку?",
                  "Установить срок клиента «" + client->email + "» до " +
-                     QDateTime::fromMSecsSinceEpoch(expiry).toString("dd.MM.yyyy HH:mm") + "?"))
+                     QDateTime::fromMSecsSinceEpoch(expiry).toString("dd.MM.yyyy HH:mm") +
+                     " через панель «" + serverName(client->serverId) + "»?"))
         return;
     auto* api = apis_.value(client->serverId);
     if (!api)
@@ -1855,10 +2320,11 @@ void MainWindow::generateDemo() {
         Inventory inv;
         inv.inbounds.append({s.id, 1, "VLESS Reality", "vless", 443, true});
         inv.inbounds.append({s.id, 2, "VLESS WebSocket", "vless", 8443, true});
-        for (int c = 0; c < 5; ++c) {
+        inv.inbounds.append({s.id, 3, "Hysteria 2", "hysteria", 11891, true});
+        for (int c = 0; c < 10; ++c) {
             Client client;
             client.serverId = s.id;
-            client.inboundIds = {1, 2};
+            client.inboundIds = {1, 2, 3};
             client.id = "example-" + QString::number(c);
             client.email = "client-" + QString::number(c + 1);
             client.subId = "demo-sub-" + QString::number(c);
@@ -1868,6 +2334,16 @@ void MainWindow::generateDemo() {
             client.usedBytes = qint64((c + 1) * 8.3 * 1024 * 1024 * 1024);
             client.totalBytes = 100LL * 1024 * 1024 * 1024;
             client.expiryTime = now.addDays(18 + c * 3).toMSecsSinceEpoch();
+            if (c == 1)
+                client.expiryTime = now.addDays(3).toMSecsSinceEpoch();
+            if (c == 3)
+                client.expiryTime = now.addDays(-1).toMSecsSinceEpoch();
+            if (c == 7 && n == 5)
+                client.enable = false;
+            if (c == 8)
+                client.usedBytes = client.totalBytes;
+            if (c == 9)
+                client.expiryTime = 0;
             inv.clients.append(client);
         }
         inventories_[s.id] = inv;
@@ -1879,7 +2355,7 @@ void MainWindow::generateDemo() {
             v.cpu = 18 + n * 4 + 8 * std::sin(m / 17.0 + n);
             v.memoryPercent = 32 + n * 4;
             v.diskPercent = 24 + n * 5;
-            v.online = int(90 + n * 15 + 25 * std::sin(m / 35.0 + n));
+            v.online = int(3 + n % 2 + 2 * std::sin(m / 35.0 + n));
             v.rxBps = (7 + n * 2.0 + 2 * std::sin(m / 19.0)) * 1024 * 1024;
             v.txBps = (12 + n * 3.0 + 4 * std::sin(m / 19.0)) * 1024 * 1024;
             v.receivedBytes = 180LL * 1024 * 1024 * 1024;

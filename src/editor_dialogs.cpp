@@ -64,14 +64,15 @@ void setFieldVisible(QFormLayout* form, QWidget* field, bool visible) {
 bool supportedProtocol(const QString& protocol) {
     const QString normalized = protocol.toLower();
     return normalized == QStringLiteral("vless") || normalized == QStringLiteral("vmess") ||
-           normalized == QStringLiteral("trojan");
+           normalized == QStringLiteral("trojan") || normalized == QStringLiteral("hysteria");
 }
 
 QString inboundTitle(const Inbound& inbound) {
     const QString title =
         inbound.remark.isEmpty() ? QStringLiteral("Inbound №%1").arg(inbound.id) : inbound.remark;
     return QStringLiteral("%1 · %2 · порт %3")
-        .arg(title, inbound.protocol.toUpper())
+        .arg(title, inbound.protocol == QStringLiteral("hysteria") ? QStringLiteral("HYSTERIA 2")
+                                                                   : inbound.protocol.toUpper())
         .arg(inbound.port);
 }
 
@@ -349,11 +350,11 @@ ClientDialog::ClientDialog(const QList<ServerConfig>& servers,
 
     auto* layout = new QVBoxLayout(this);
     layout->setSpacing(12);
-    layout->addWidget(
-        helperLabel(editing ? tr("Измените лимит трафика, срок действия или состояние клиента.")
-                            : tr("Выберите inbound VLESS, VMess или Trojan на одном или "
-                                 "нескольких серверах."),
-                    this));
+    layout->addWidget(helperLabel(
+        editing ? tr("Измените лимит трафика, срок действия или состояние клиента.")
+                : tr("Выберите inbound VLESS, VMess, Trojan или Hysteria 2 на одном или "
+                     "нескольких серверах."),
+        this));
     auto* formContainer = new QWidget(this);
     auto* form = new QFormLayout(formContainer);
     form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
@@ -437,7 +438,11 @@ ClientDialog::ClientDialog(const QList<ServerConfig>& servers,
             if (isMaster)
                 masterName = serverTitle(config);
             auto* node = new QTreeWidgetItem(targetTree);
-            node->setText(0, serverTitle(config) + (isMaster ? tr(" · мастер") : QString()));
+            node->setText(
+                0, serverTitle(config) +
+                       (isMaster && !serverTitle(config).contains(tr("мастер"), Qt::CaseInsensitive)
+                            ? tr(" · мастер")
+                            : QString()));
             node->setData(0, serverIdRole, config.id);
             node->setFlags(Qt::ItemIsSelectable | Qt::ItemIsEnabled | Qt::ItemIsUserCheckable);
             node->setCheckState(0, Qt::Unchecked);
@@ -513,7 +518,7 @@ ClientDialog::ClientDialog(const QList<ServerConfig>& servers,
         form->addRow(selectionCount);
         auto* sharedIdentifiers =
             helperLabel(tr("Все выбранные серверы получат общие UUID и subId, "
-                           "созданные автоматически. Для Trojan пароль также общий."),
+                           "созданные автоматически. Пароль Trojan и auth Hysteria 2 также общие."),
                         this);
         sharedIdentifiers->setObjectName(QStringLiteral("sharedIdentifiers"));
         form->addRow(sharedIdentifiers);

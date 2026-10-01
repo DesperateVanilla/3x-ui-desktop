@@ -11,7 +11,7 @@ struct ChartPoint {
 };
 class ChartWidget : public QWidget {
   public:
-    enum class Kind { Online, Bandwidth };
+    enum class Kind { Online, Bandwidth, Percent, Latency };
     explicit ChartWidget(Kind kind, QWidget* parent = nullptr);
     void setPoints(QList<ChartPoint> points, QDateTime from, QDateTime to);
 

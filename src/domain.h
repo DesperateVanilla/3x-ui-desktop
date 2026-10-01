@@ -3,6 +3,7 @@
 #include <QJsonObject>
 #include <QList>
 #include <QString>
+#include <QStringList>
 #include <QUrl>
 #include <functional>
 #include <optional>
@@ -50,6 +51,8 @@ struct Snapshot {
     std::optional<qint64> receivedBytes;
     std::optional<qint64> sentBytes;
     std::optional<int> online;
+    QStringList onlineEmails; // Live API observation; not persisted in metric history.
+    bool onlineDetailsAvailable = false;
     std::optional<int> latencyMs;
     QString panelVersion;
     QString xrayVersion;
@@ -94,6 +97,7 @@ struct ClientDraft {
     QString flow;
     QString clientId;
     QString password;
+    QString hysteriaAuth;
     QString subId;
 };
 struct ClientTarget {

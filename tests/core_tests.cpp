@@ -773,6 +773,38 @@ class CoreTests : public QObject {
             QVERIFY(!mock.requests.at(1).headers.contains("x-csrf-token"));
     }
 
+    void onlineObservationsDistinguishMissingFromEmptyAndDeduplicate_data() {
+        QTest::addColumn<QJsonArray>("emails");
+        QTest::addColumn<int>("count");
+        QTest::newRow("empty-known") << QJsonArray{} << 0;
+        QTest::newRow("unique") << (QJsonArray{"alice", "bob"}) << 2;
+        QTest::newRow("duplicate") << (QJsonArray{"alice", "alice", "bob"}) << 2;
+        QTest::newRow("malformed") << (QJsonArray{"alice", 42}) << -1;
+    }
+    void onlineObservationsDistinguishMissingFromEmptyAndDeduplicate() {
+        QFETCH(QJsonArray, emails);
+        QFETCH(int, count);
+        MockPanel mock;
+        ThreeXUiApi api(configuration(mock));
+        mock.add(200, envelope(QJsonObject{{"cpu", 5}}));
+        mock.add(200, envelope(emails));
+        bool done = false;
+        Outcome<Snapshot> result;
+        api.fetchStatus([&](auto value) {
+            result = std::move(value);
+            done = true;
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(done, 3000);
+        QVERIFY(result.ok);
+        QCOMPARE(result.value.onlineDetailsAvailable, count >= 0);
+        QCOMPARE(result.value.online.has_value(), count >= 0);
+        if (count >= 0) {
+            QCOMPARE(*result.value.online, count);
+            QCOMPARE(result.value.onlineEmails.size(), count);
+        }
+        QVERIFY(result.value.cpu);
+        QCOMPARE(*result.value.cpu, 5.0);
+    }
     void legacyStatusFallbackAndOnlineFailureKeepMetrics() {
         MockPanel mock;
         ThreeXUiApi api(configuration(mock, ApiFlavor::LegacyV2));
@@ -936,6 +968,7 @@ class CoreTests : public QObject {
         QTest::newRow("vless") << QStringLiteral("vless");
         QTest::newRow("vmess") << QStringLiteral("vmess");
         QTest::newRow("trojan") << QStringLiteral("trojan");
+        QTest::newRow("hysteria2") << QStringLiteral("hysteria");
     }
 
     void modernCreateUsesProtocolCredentialsAndByteLimits() {
@@ -985,6 +1018,8 @@ class CoreTests : public QObject {
             QVERIFY(!client.contains(QStringLiteral("password")));
         if (protocol == QStringLiteral("vmess"))
             QCOMPARE(client.value(QStringLiteral("security")).toString(), QStringLiteral("auto"));
+        if (protocol == QStringLiteral("hysteria"))
+            QCOMPARE(client.value(QStringLiteral("auth")).toString().size(), 32);
         QCOMPARE(client.value(QStringLiteral("limitIp")).toInt(), 0);
         QCOMPARE(client.value(QStringLiteral("limitHwid")).toInt(), 0);
     }
@@ -1057,12 +1092,14 @@ class CoreTests : public QObject {
         MockPanel mock;
         ThreeXUiApi api(configuration(mock));
         mock.add(200, envelope(QJsonArray{inbound(1), inbound(2, QStringLiteral("vmess")),
-                                          inbound(3, QStringLiteral("trojan"))}));
+                                          inbound(3, QStringLiteral("trojan")),
+                                          inbound(4, QStringLiteral("hysteria"))}));
         mock.add(200, envelope(QJsonArray{}));
         mock.add(200, envelope());
         mock.reflectCreatedClient(true);
         auto draft = sharedDraft();
-        draft.inboundIds = {1, 2, 3};
+        draft.inboundIds = {1, 2, 3, 4};
+        draft.hysteriaAuth = "shared-hysteria-auth";
         draft.flow.clear();
         bool done = false;
         Outcome<bool> result;
@@ -1074,12 +1111,125 @@ class CoreTests : public QObject {
         QVERIFY2(result.ok, qPrintable(result.error));
         QCOMPARE(mock.requests.size(), 4);
         const auto body = QJsonDocument::fromJson(mock.requests.at(2).body).object();
-        QCOMPARE(body.value(QStringLiteral("inboundIds")).toArray(), (QJsonArray{1, 2, 3}));
+        QCOMPARE(body.value(QStringLiteral("inboundIds")).toArray(), (QJsonArray{1, 2, 3, 4}));
         const auto client = body.value(QStringLiteral("client")).toObject();
         QCOMPARE(client.value(QStringLiteral("id")).toString(), draft.clientId);
         QCOMPARE(client.value(QStringLiteral("password")).toString(), draft.password);
+        QCOMPARE(client.value(QStringLiteral("auth")).toString(), draft.hysteriaAuth);
         QCOMPARE(client.value(QStringLiteral("subId")).toString(), draft.subId);
         QCOMPARE(client.value(QStringLiteral("security")).toString(), QStringLiteral("auto"));
+    }
+
+    void legacyHysteriaCreationUsesAuthAndPreservesItOnEdit() {
+        MockPanel mock;
+        ThreeXUiApi api(configuration(mock, ApiFlavor::LegacyV2));
+        mock.add(200, envelope(QJsonArray{inbound(1, "hysteria")}));
+        mock.add(200, envelope());
+        auto draft = sharedDraft();
+        draft.inboundIds = {1};
+        draft.flow.clear();
+        draft.password.clear();
+        draft.hysteriaAuth = "legacy-hysteria-key";
+        bool done = false;
+        Outcome<bool> result;
+        api.createClient(draft, [&](auto value) {
+            result = std::move(value);
+            done = true;
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(done, 3000);
+        QVERIFY2(result.ok, qPrintable(result.error));
+        const auto raw = formClient(mock.requests.last().body);
+        QCOMPARE(raw.value("auth").toString(), draft.hysteriaAuth);
+        QVERIFY(!raw.contains("id"));
+        auto ib = legacyInbound(raw);
+        ib.insert("protocol", "hysteria");
+        const auto inventory = ThreeXUiApi::parseInventory(QJsonArray{ib}, {}, "server-one", false);
+        QVERIFY(inventory.ok);
+        QCOMPARE(inventory.value.clients.first().id, draft.hysteriaAuth);
+        mock.add(200, envelope(QJsonArray{ib}));
+        mock.add(200, envelope());
+        done = false;
+        ClientPatch patch;
+        patch.totalBytes = 42;
+        api.updateClient(inventory.value.clients.first(), patch, [&](auto value) {
+            result = std::move(value);
+            done = true;
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(done, 3000);
+        QVERIFY2(result.ok, qPrintable(result.error));
+        const auto updated = formClient(mock.requests.last().body);
+        QCOMPARE(updated.value("auth").toString(), draft.hysteriaAuth);
+        QCOMPARE(updated.value("totalGB").toInteger(), 42);
+        QVERIFY(mock.requests.last().target.endsWith("/updateClient/legacy-hysteria-key"));
+    }
+
+    void modernHysteriaWithoutUuidUsesAuthOnlyAsIdentity() {
+        MockPanel mock;
+        ThreeXUiApi api(configuration(mock));
+        auto raw = modernRecord();
+        raw.insert("uuid", "");
+        raw.insert("password", "");
+        raw.insert("auth", "hysteria-key");
+        raw.insert("inboundIds", QJsonArray{1});
+        raw.insert("flow", "");
+        const auto inventory = ThreeXUiApi::parseInventory(QJsonArray{inbound(1, "hysteria")},
+                                                           QJsonArray{raw}, "server-one", true);
+        QVERIFY(inventory.ok);
+        const auto selected = inventory.value.clients.first();
+        QCOMPARE(selected.id, QString("hysteria-key"));
+        mock.add(200, envelope(freshResponse(raw)));
+        mock.add(200, envelope());
+        bool done = false;
+        Outcome<bool> result;
+        ClientPatch patch;
+        patch.enable = false;
+        api.updateClient(selected, patch, [&](auto value) {
+            result = std::move(value);
+            done = true;
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(done, 3000);
+        QVERIFY2(result.ok, qPrintable(result.error));
+        const auto updated = QJsonDocument::fromJson(mock.requests.last().body).object();
+        QCOMPARE(updated.value("auth").toString(), QString("hysteria-key"));
+        QCOMPARE(updated.value("id").toString(), QString());
+        QVERIFY(!updated.value("enable").toBool());
+        raw.insert("auth", "rotated-hysteria-key");
+        mock.add(200, envelope(freshResponse(raw)));
+        done = false;
+        api.deleteClient(selected, [&](auto value) {
+            result = std::move(value);
+            done = true;
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(done, 3000);
+        QVERIFY(!result.ok);
+        QCOMPARE(mock.requests.size(), 3);
+    }
+
+    void modernHysteriaRejectsCredentialCollisionBeforeWriting() {
+        MockPanel mock;
+        ThreeXUiApi api(configuration(mock));
+        auto raw = modernRecord();
+        raw.insert("auth", "shared-auth");
+        mock.add(200, envelope(QJsonArray{inbound(1, "hysteria")}));
+        mock.add(200, envelope(QJsonArray{raw}));
+        auto draft = sharedDraft();
+        draft.inboundIds = {1};
+        draft.email = "different-email";
+        draft.flow.clear();
+        draft.clientId = "22222222-2222-4333-8444-555555555555";
+        draft.password.clear();
+        draft.subId = "different-sub";
+        draft.hysteriaAuth = "shared-auth";
+        bool done = false;
+        Outcome<bool> result;
+        api.createClient(draft, [&](auto value) {
+            result = std::move(value);
+            done = true;
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(done, 3000);
+        QVERIFY(!result.ok);
+        QCOMPARE(mock.requests.size(), 2);
+        QVERIFY(!result.error.contains(draft.hysteriaAuth));
     }
 
     void legacyRejectsMultipleInboundsBeforeWriting() {

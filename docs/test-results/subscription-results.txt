@@ -1,0 +1,19 @@
+********* Start testing of SubscriptionTests *********
+Config: Using QtTest library 6.8.3, Qt 6.8.3 (x86_64-little_endian-llp64 shared (dynamic) release build; by MSVC 2022), windows 11
+PASS   : SubscriptionTests::initTestCase()
+PASS   : SubscriptionTests::fiftyCopiesAreTenSubscriptionsAndUseMasterTraffic()
+PASS   : SubscriptionTests::identityPreventsNameCollisionsAndSecretsAreHashed()
+PASS   : SubscriptionTests::fallsBackToCredentialButEmptyIdentifiersStaySeparate()
+PASS   : SubscriptionTests::partialInventoryHasDeterministicPrimaryAndProtocolUnion()
+PASS   : SubscriptionTests::unknownOnlineIsPreserved(all-unknown)
+PASS   : SubscriptionTests::unknownOnlineIsPreserved(partial-offline)
+PASS   : SubscriptionTests::unknownOnlineIsPreserved(all-offline)
+PASS   : SubscriptionTests::unknownOnlineIsPreserved(known-online)
+PASS   : SubscriptionTests::unknownOnlineIsPreserved(both-online)
+PASS   : SubscriptionTests::statesAndExpiryBoundaries()
+PASS   : SubscriptionTests::reportsConflictingSettingsButDoesNotCompareNodeTraffic()
+PASS   : SubscriptionTests::filtersWorkOnGroupsAndServerNames()
+PASS   : SubscriptionTests::summationSaturatesAndInactiveClientsDoNotCountAsExpiring()
+PASS   : SubscriptionTests::cleanupTestCase()
+Totals: 15 passed, 0 failed, 0 skipped, 0 blacklisted, 1ms
+********* Finished testing of SubscriptionTests *********

@@ -107,6 +107,11 @@ QString identifier(const QJsonObject& raw, const QString& protocol = {}) {
     const QString uuid = raw.value(QStringLiteral("uuid")).toString();
     if (!uuid.isEmpty())
         return uuid;
+    if (protocol == QStringLiteral("hysteria")) {
+        const QString auth = raw.value(QStringLiteral("auth")).toString();
+        if (!auth.isEmpty())
+            return auth;
+    }
     if (protocol == QStringLiteral("trojan")) {
         const QString password = raw.value(QStringLiteral("password")).toString();
         if (!password.isEmpty())
@@ -115,7 +120,8 @@ QString identifier(const QJsonObject& raw, const QString& protocol = {}) {
     const QString id = raw.value(QStringLiteral("id")).toString();
     if (!id.isEmpty())
         return id;
-    return raw.value(QStringLiteral("password")).toString();
+    const QString password = raw.value(QStringLiteral("password")).toString();
+    return password.isEmpty() ? raw.value(QStringLiteral("auth")).toString() : password;
 }
 
 Outcome<QList<int>> inboundIds(const QJsonValue& value) {
@@ -148,7 +154,7 @@ bool sameIdentity(const Client& selected, const QJsonObject& fresh, const QList<
         identifier(fresh, selected.protocol) != selected.id ||
         !sameInboundIds(selected.inboundIds, ids))
         return false;
-    for (const auto* key : {"uuid", "password", "subId"}) {
+    for (const auto* key : {"uuid", "password", "auth", "subId"}) {
         const QString field = QString::fromLatin1(key);
         if (selected.raw.contains(field) && selected.raw.value(field) != fresh.value(field))
             return false;
@@ -197,7 +203,13 @@ QString identityError() {
 }
 
 Outcome<QJsonObject> modernModel(QJsonObject record, const QString& protocol) {
-    record.insert(QStringLiteral("id"), identifier(record, protocol));
+    Q_UNUSED(protocol);
+    // Password/auth identifies a client for a stale-record check, but is not
+    // the UUID field of model.Client. Pure Hysteria clients may have no UUID.
+    QString uuid = record.value(QStringLiteral("uuid")).toString();
+    if (uuid.isEmpty())
+        uuid = record.value(QStringLiteral("id")).toString();
+    record.insert(QStringLiteral("id"), uuid);
     record.remove(QStringLiteral("inboundIds"));
     // ClientRecord is a database DTO rather than model.Client. Besides its
     // numeric primary key, it serializes these model fields as text.
@@ -263,7 +275,8 @@ Outcome<QList<Inbound>> selectedInbounds(const QJsonArray& data, const ClientDra
                 QStringLiteral("Inbound удалён или отключён. Обновите список."));
         if (found->protocol != QStringLiteral("vless") &&
             found->protocol != QStringLiteral("vmess") &&
-            found->protocol != QStringLiteral("trojan"))
+            found->protocol != QStringLiteral("trojan") &&
+            found->protocol != QStringLiteral("hysteria"))
             return Outcome<QList<Inbound>>::failure(
                 QStringLiteral("Создание клиента для этого протокола пока не поддерживается."));
         if (!draft.flow.isEmpty() && found->protocol != QStringLiteral("vless"))
@@ -276,15 +289,16 @@ Outcome<QList<Inbound>> selectedInbounds(const QJsonArray& data, const ClientDra
 
 bool matchesDraft(const QJsonObject& raw, const ClientDraft& draft, bool checkEnable = true,
                   const QString& legacyProtocol = {}, bool vmess = false) {
-    const QString access = legacyProtocol == QStringLiteral("trojan")
-                               ? raw.value(QStringLiteral("password")).toString()
-                               : identifier(raw);
-    const QString expected =
-        legacyProtocol == QStringLiteral("trojan") ? draft.password : draft.clientId;
+    const QString access = identifier(raw, legacyProtocol);
+    const QString expected = legacyProtocol == QStringLiteral("trojan")     ? draft.password
+                             : legacyProtocol == QStringLiteral("hysteria") ? draft.hysteriaAuth
+                                                                            : draft.clientId;
     const auto quota = integer(raw.value(QStringLiteral("totalGB")));
     const auto expiry = integer(raw.value(QStringLiteral("expiryTime")), true);
     return raw.value(QStringLiteral("email")).toString() == draft.email && access == expected &&
            raw.value(QStringLiteral("password")).toString() == draft.password &&
+           (draft.hysteriaAuth.isEmpty() ||
+            raw.value(QStringLiteral("auth")).toString() == draft.hysteriaAuth) &&
            raw.value(QStringLiteral("subId")).toString() == draft.subId && quota &&
            *quota == draft.totalBytes && expiry && *expiry == draft.expiryTime &&
            raw.value(QStringLiteral("enable")).isBool() &&
@@ -296,9 +310,11 @@ bool matchesDraft(const QJsonObject& raw, const ClientDraft& draft, bool checkEn
 QJsonObject newClient(const ClientDraft& draft, const QList<Inbound>& inbounds, bool modern) {
     bool vmess = false;
     bool trojan = false;
+    bool hysteria = false;
     for (const auto& inbound : inbounds) {
         vmess |= inbound.protocol == QStringLiteral("vmess");
         trojan |= inbound.protocol == QStringLiteral("trojan");
+        hysteria |= inbound.protocol == QStringLiteral("hysteria");
     }
     QJsonObject client{{QStringLiteral("email"), draft.email},
                        {QStringLiteral("totalGB"), draft.totalBytes},
@@ -311,10 +327,12 @@ QJsonObject newClient(const ClientDraft& draft, const QList<Inbound>& inbounds, 
                        {QStringLiteral("tgId"), 0},
                        {QStringLiteral("comment"), QString()},
                        {QStringLiteral("reset"), 0}};
-    if (modern || !trojan)
+    if (modern || (!trojan && !hysteria))
         client.insert(QStringLiteral("id"), draft.clientId);
     if (!draft.password.isEmpty())
         client.insert(QStringLiteral("password"), draft.password);
+    if (!draft.hysteriaAuth.isEmpty())
+        client.insert(QStringLiteral("auth"), draft.hysteriaAuth);
     if (vmess)
         client.insert(QStringLiteral("security"), QStringLiteral("auto"));
     return client;
@@ -873,8 +891,22 @@ void ThreeXUiApi::fetchStatus(Callback<Snapshot> callback) {
                         request("POST", path, {},
                                 [finish,
                                  parsed = std::move(parsed)](Outcome<QJsonValue> online) mutable {
-                                    if (online.ok && online.value.isArray())
-                                        parsed.value.online = online.value.toArray().size();
+                                    if (online.ok && online.value.isArray()) {
+                                        QSet<QString> emails;
+                                        bool valid = true;
+                                        for (const auto& entry : online.value.toArray()) {
+                                            if (!entry.isString() || entry.toString().isEmpty()) {
+                                                valid = false;
+                                                break;
+                                            }
+                                            emails.insert(entry.toString());
+                                        }
+                                        if (valid) {
+                                            parsed.value.onlineEmails = emails.values();
+                                            parsed.value.online = static_cast<int>(emails.size());
+                                            parsed.value.onlineDetailsAvailable = true;
+                                        }
+                                    }
                                     finish(std::move(parsed));
                                 });
                     });
@@ -971,7 +1003,7 @@ void ThreeXUiApi::createClient(const ClientDraft& draft, Callback<bool> callback
         }
         if (!draft.clientId.isEmpty() && QUuid(draft.clientId).isNull())
             valid = false;
-        for (const auto& secret : {draft.password, draft.subId}) {
+        for (const auto& secret : {draft.password, draft.hysteriaAuth, draft.subId}) {
             if (secret.size() > 512)
                 valid = false;
             for (const auto& character : secret) {
@@ -1026,6 +1058,11 @@ void ThreeXUiApi::createClient(const ClientDraft& draft, Callback<bool> callback
                     if (plan.password.isEmpty() &&
                         selected.value.first().protocol == QStringLiteral("trojan"))
                         plan.password = randomSecret(32);
+                    if (plan.hysteriaAuth.isEmpty() &&
+                        selected.value.first().protocol == QStringLiteral("hysteria"))
+                        plan.hysteriaAuth = randomSecret(32);
+                    if (selected.value.first().protocol != QStringLiteral("hysteria"))
+                        plan.hysteriaAuth.clear();
                     const auto inventory =
                         parseInventory(response.value.toArray(), {}, config_.id, false);
                     if (!inventory.ok) {
@@ -1043,7 +1080,10 @@ void ThreeXUiApi::createClient(const ClientDraft& draft, Callback<bool> callback
                         } else if (client.subId == plan.subId || client.id == plan.clientId ||
                                    (selected.value.first().protocol == QStringLiteral("trojan") &&
                                     client.raw.value(QStringLiteral("password")).toString() ==
-                                        plan.password)) {
+                                        plan.password) ||
+                                   (selected.value.first().protocol == QStringLiteral("hysteria") &&
+                                    client.raw.value(QStringLiteral("auth")).toString() ==
+                                        plan.hysteriaAuth)) {
                             finish(Outcome<bool>::failure(collisionError()));
                             return;
                         }
@@ -1093,16 +1133,22 @@ void ThreeXUiApi::createModern(const ClientDraft& initialPlan, Callback<bool> ca
             }
             bool vmess = false;
             bool trojan = false;
+            bool hysteria = false;
             for (const auto& inbound : selected.value) {
                 vmess |= inbound.protocol == QStringLiteral("vmess");
                 trojan |= inbound.protocol == QStringLiteral("trojan");
+                hysteria |= inbound.protocol == QStringLiteral("hysteria");
                 if (inbound.protocol == QStringLiteral("trojan") && plan.password.isEmpty())
                     plan.password = randomSecret(32);
+                if (inbound.protocol == QStringLiteral("hysteria") && plan.hysteriaAuth.isEmpty())
+                    plan.hysteriaAuth = randomSecret(32);
             }
+            if (!hysteria)
+                plan.hysteriaAuth.clear();
             const auto client = newClient(plan, selected.value, true);
             request(
                 "GET", QStringLiteral("/panel/api/clients/list"), {},
-                [this, plan, client, vmess, trojan,
+                [this, plan, client, vmess, trojan, hysteria,
                  callback = std::move(callback)](Outcome<QJsonValue> listed) mutable {
                     if (!listed.ok || !listed.value.isArray()) {
                         callback(Outcome<bool>::failure(
@@ -1131,7 +1177,9 @@ void ThreeXUiApi::createModern(const ClientDraft& initialPlan, Callback<bool> ca
                         } else if (raw.value(QStringLiteral("subId")).toString() == plan.subId ||
                                    identifier(raw) == plan.clientId ||
                                    (trojan && raw.value(QStringLiteral("password")).toString() ==
-                                                  plan.password)) {
+                                                  plan.password) ||
+                                   (hysteria && raw.value(QStringLiteral("auth")).toString() ==
+                                                    plan.hysteriaAuth)) {
                             callback(Outcome<bool>::failure(collisionError()));
                             return;
                         }
