@@ -3,8 +3,9 @@ Config: Using QtTest library 6.8.3, Qt 6.8.3 (x86_64-little_endian-llp64 shared 
 PASS   : WindowTests::initTestCase()
 PASS   : WindowTests::subscriptionsGroupCopiesAndKeepAllServersInDetails()
 PASS   : WindowTests::combinedFiltersAndClearWorkOnUniqueRows()
+PASS   : WindowTests::copyDiscoversAndRefreshesAddressFromMasterPanel()
 PASS   : WindowTests::serverFiltersCombineLocationHealthAndSearch()
 PASS   : WindowTests::splittersResizeAndPersistOutsideDemo()
 PASS   : WindowTests::cleanupTestCase()
-Totals: 6 passed, 0 failed, 0 skipped, 0 blacklisted, 442ms
+Totals: 7 passed, 0 failed, 0 skipped, 0 blacklisted, 666ms
 ********* Finished testing of WindowTests *********

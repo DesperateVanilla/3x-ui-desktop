@@ -5,6 +5,7 @@
 #include <QHash>
 #include <QMainWindow>
 #include <QQueue>
+#include <QSet>
 #include <QTimer>
 
 class QLabel;
@@ -39,6 +40,9 @@ class MainWindow : public QMainWindow {
     QList<ActivityEvent> events_;
     QHash<QString, Inventory> inventories_;
     QHash<QString, QString> inventoryErrors_;
+    QHash<QString, QUrl> subscriptionAddresses_;
+    QHash<QString, QString> subscriptionAddressErrors_;
+    QSet<QString> subscriptionAddressPending_;
     QList<SubscriptionGroup> subscriptionGroups_;
     QList<SubscriptionGroup> visibleSubscriptions_;
     QStringList visibleServers_;
@@ -85,6 +89,7 @@ class MainWindow : public QMainWindow {
     QLabel* masterStatus_ = nullptr;
     QLineEdit* serverSearch_ = nullptr;
     QLineEdit* clientSearch_ = nullptr;
+    QLineEdit* subscriptionLink_ = nullptr;
     QTableWidget* serverTable_ = nullptr;
     QTableWidget* clientTable_ = nullptr;
     QTableWidget* clientNodesTable_ = nullptr;
@@ -141,6 +146,8 @@ class MainWindow : public QMainWindow {
     void refreshMasterSelector();
     QString activeMasterServerId() const;
     void copySubscriptionLink();
+    void discoverSubscriptionAddress(const QString& serverId);
+    void viewClientInbounds();
     void runServerAction(ServerAction action);
     void completeMutation(const QString& serverId, const QString& action, OperationResult result);
     void recordEvent(const QString& serverId, const QString& action, bool success,

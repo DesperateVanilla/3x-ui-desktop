@@ -1,6 +1,7 @@
 #include "main_window.h"
 #include "backup_file.h"
 #include "chart_widget.h"
+#include "client_inbounds_dialog.h"
 #include "client_provisioner.h"
 #include "editor_dialogs.h"
 #include "three_x_ui_api.h"
@@ -40,6 +41,17 @@
 
 namespace fleet {
 namespace {
+QString subscriptionLink(const QUrl& base, const QString& subId) {
+    if (base.isEmpty() || subId.isEmpty())
+        return {};
+    QUrl link = base;
+    QString path = link.path(QUrl::FullyEncoded);
+    if (!path.endsWith('/'))
+        path += '/';
+    path += QString::fromLatin1(QUrl::toPercentEncoding(subId));
+    link.setPath(path, QUrl::StrictMode);
+    return link.toString(QUrl::FullyEncoded);
+}
 QString bytes(double value, bool rate = false) {
     const QString suffix = rate ? "/с" : "";
     const QStringList units = {"Б", "КБ", "МБ", "ГБ", "ТБ"};
@@ -346,7 +358,7 @@ void MainWindow::buildUi() {
     connect(demoButton_, &QPushButton::clicked, this, [this] { setDemo(!demo_); });
     side->addSpacing(16);
     side->addWidget(label("C++ / Qt  ·  Windows", "muted"));
-    side->addWidget(label("Локальная история · v0.3", "muted"));
+    side->addWidget(label("Локальная история · v0.4", "muted"));
     frame->addWidget(sidebar);
     auto* main = new QWidget;
     auto* layout = new QVBoxLayout(main);
@@ -704,6 +716,10 @@ QWidget* MainWindow::clientsPage() {
     layout->addLayout(advanced);
     auto* toolbar = new QHBoxLayout;
     auto* create = button("+ Создать", "primary");
+    auto* bindings = button("Инбаунды");
+    bindings->setObjectName("viewClientInbounds");
+    bindings->setToolTip(
+        "Посмотреть подключённые инбаунды и добавить новые через выбранную панель");
     create->setToolTip("Создать подписку на выбранных серверах и инбаундах");
     create->setAccessibleName("Создать подписку");
     auto* edit = button("Изменить");
@@ -719,9 +735,11 @@ QWidget* MainWindow::clientsPage() {
         writeButtons_.append(action);
     }
     toolbar->addStretch();
+    toolbar->insertWidget(2, bindings);
     layout->addLayout(toolbar);
     connect(create, &QPushButton::clicked, this, [this] { editClient(true); });
     connect(edit, &QPushButton::clicked, this, [this] { editClient(false); });
+    connect(bindings, &QPushButton::clicked, this, &MainWindow::viewClientInbounds);
     connect(renew, &QPushButton::clicked, this, &MainWindow::renewClient);
     connect(toggle, &QPushButton::clicked, this, &MainWindow::toggleClient);
     connect(reset, &QPushButton::clicked, this, &MainWindow::resetClient);
@@ -742,7 +760,7 @@ QWidget* MainWindow::clientsPage() {
     clientTable_->setColumnWidth(2, 180);
     split->addWidget(clientTable_);
     auto* detail = card();
-    detail->setMinimumHeight(200);
+    detail->setMinimumHeight(235);
     auto* detailLayout = new QVBoxLayout(detail);
     detailLayout->setContentsMargins(14, 10, 14, 10);
     auto* head = new QHBoxLayout;
@@ -755,16 +773,26 @@ QWidget* MainWindow::clientsPage() {
     clientActionServer_->setMinimumWidth(160);
     head->addWidget(clientActionServer_);
     detailLayout->addLayout(head);
-    clientNodesTable_ = table({"СЕРВЕР", "СВЯЗЬ", "КЛИЕНТ", "ТРАФИК / ЛИМИТ", "ДЕЙСТВУЕТ ДО"});
+    clientNodesTable_ =
+        table({"СЕРВЕР", "СВЯЗЬ", "КЛИЕНТ", "ТРАФИК / ЛИМИТ", "ДЕЙСТВУЕТ ДО", "ИНБАУНДЫ"});
     clientNodesTable_->setObjectName("subscriptionNodesTable");
     clientNodesTable_->verticalHeader()->setDefaultSectionSize(36);
     clientNodesTable_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Interactive);
     clientNodesTable_->setColumnWidth(0, 240);
     detailLayout->addWidget(clientNodesTable_, 1);
+    auto* linkRow = new QHBoxLayout;
+    linkRow->addWidget(label("Ссылка подписки:", "muted"));
+    subscriptionLink_ = new QLineEdit;
+    subscriptionLink_->setObjectName("subscriptionLink");
+    subscriptionLink_->setReadOnly(true);
+    linkRow->addWidget(subscriptionLink_, 1);
+    detailLayout->addLayout(linkRow);
     split->addWidget(detail);
     configureSplitter(split, "subscriptionDetails", {360, 240});
     layout->addWidget(split, 1);
     connect(clientTable_, &QTableWidget::itemSelectionChanged, this,
+            &MainWindow::refreshClientDetails);
+    connect(clientActionServer_, &QComboBox::currentIndexChanged, this,
             &MainWindow::refreshClientDetails);
     connect(clientTable_, &QTableWidget::itemDoubleClicked, this, [this] { editClient(false); });
     connect(clientNodesTable_, &QTableWidget::itemDoubleClicked, this,
@@ -779,6 +807,7 @@ QWidget* MainWindow::clientsPage() {
     clientStatus_->setWordWrap(true);
     footer->addWidget(clientStatus_, 1);
     auto* copy = button("Копировать ссылку подписки");
+    copy->setObjectName("copySubscriptionLink");
     footer->addWidget(copy);
     connect(copy, &QPushButton::clicked, this, &MainWindow::copySubscriptionLink);
     layout->addLayout(footer);
@@ -975,21 +1004,55 @@ void MainWindow::copySubscriptionLink() {
     }
     const auto server =
         std::find_if(servers_.cbegin(), servers_.cend(), [&](const auto& s) { return s.id == id; });
-    if (server == servers_.cend() || server->subscriptionUrl.isEmpty() || client->subId.isEmpty()) {
-        report("Укажите адрес выдачи подписок в настройках " +
-                   QString(master.isEmpty() ? "выбранного сервера" : "мастер-ноды") +
-                   ". Например: https://vpn.example.com:2096/sub/",
-               true);
+    if (server == servers_.cend() || client->subId.isEmpty()) {
+        report("У клиента нет subId. Проверьте его настройки в 3x-ui.", true);
         return;
     }
-    QUrl link = server->subscriptionUrl;
-    QString path = link.path(QUrl::FullyEncoded);
-    if (!path.endsWith('/'))
-        path += '/';
-    path += QString::fromLatin1(QUrl::toPercentEncoding(client->subId));
-    link.setPath(path, QUrl::StrictMode);
-    QApplication::clipboard()->setText(link.toString(QUrl::FullyEncoded));
-    report("Ссылка подписки скопирована: " + server->name + ".");
+    if (!server->subscriptionUrl.isEmpty()) {
+        QApplication::clipboard()->setText(
+            subscriptionLink(server->subscriptionUrl, client->subId));
+        report("Ссылка подписки скопирована: " + server->name + ".");
+        return;
+    }
+    auto* api = apis_.value(id);
+    if (!api || demo_) {
+        report("Подключение панели недоступно.", true);
+        return;
+    }
+    report("Получаю адрес подписок из панели «" + server->name + "»…");
+    // Query afresh on every explicit copy, so edits made in the panel take effect immediately.
+    api->fetchSubscriptionUrl([this, id, subId = client->subId](Outcome<QUrl> result) {
+        if (!result.ok) {
+            subscriptionAddresses_.remove(id);
+            subscriptionAddressErrors_[id] = result.error;
+            refreshClientDetails();
+            report("Не удалось получить адрес подписок: " + result.error, true);
+            return;
+        }
+        subscriptionAddresses_[id] = result.value;
+        subscriptionAddressErrors_.remove(id);
+        QApplication::clipboard()->setText(subscriptionLink(result.value, subId));
+        refreshClientDetails();
+        report("Ссылка подписки получена из панели и скопирована: " + serverName(id) + ".");
+    });
+}
+
+void MainWindow::discoverSubscriptionAddress(const QString& id) {
+    if (demo_ || subscriptionAddresses_.contains(id) || subscriptionAddressErrors_.contains(id) ||
+        subscriptionAddressPending_.contains(id) || !apis_.contains(id))
+        return;
+    subscriptionAddressPending_.insert(id);
+    apis_[id]->fetchSubscriptionUrl([this, id](Outcome<QUrl> result) {
+        subscriptionAddressPending_.remove(id);
+        if (result.ok) {
+            subscriptionAddresses_[id] = result.value;
+            subscriptionAddressErrors_.remove(id);
+        } else {
+            subscriptionAddresses_.remove(id);
+            subscriptionAddressErrors_[id] = result.error;
+        }
+        refreshClientDetails();
+    });
 }
 void MainWindow::report(const QString& text, bool error) {
     notice_->setText(text);
@@ -1397,11 +1460,13 @@ void MainWindow::refreshClientDetails() {
     const QSignalBlocker blocker(clientActionServer_);
     clientActionServer_->clear();
     clientNodesTable_->setRowCount(0);
+    subscriptionLink_->clear();
     const int row = clientTable_->currentRow();
     if (row < 0 || row >= visibleSubscriptions_.size()) {
         clientDetail_->setText("Выберите подписку, чтобы увидеть связанные серверы");
         clientActionServer_->setProperty("groupKey", "");
         clientActionServer_->setEnabled(false);
+        subscriptionLink_->setPlaceholderText("Выберите подписку");
         return;
     }
     const auto& group = visibleSubscriptions_[row];
@@ -1441,11 +1506,42 @@ void MainWindow::refreshClientDetails() {
              bytes(double(member->usedBytes)) + " / " +
                  (member->totalBytes ? bytes(double(member->totalBytes)) : "∞"));
         cell(clientNodesTable_, nodeRow, 4, expiryText(member->expiryTime));
+        QStringList inbounds;
+        for (const int inboundId : member->inboundIds) {
+            const auto inventory = inventories_.value(id);
+            const auto bound =
+                std::find_if(inventory.inbounds.cbegin(), inventory.inbounds.cend(),
+                             [inboundId](const auto& inbound) { return inbound.id == inboundId; });
+            inbounds << (bound == inventory.inbounds.cend()
+                             ? QString("№%1").arg(inboundId)
+                             : QString("№%1 · %2").arg(inboundId).arg(bound->remark));
+        }
+        cell(clientNodesTable_, nodeRow, 5, inbounds.join(", "), QColor("#e4edf8"),
+             inbounds.join("\n"));
     }
     const QString target = previousGroup == group.key ? previousServer : group.primary().serverId;
     const int targetIndex = clientActionServer_->findData(target);
     clientActionServer_->setCurrentIndex(
         targetIndex >= 0 ? targetIndex : clientActionServer_->findData(group.primary().serverId));
+    const QString source =
+        activeMasterServerId().isEmpty() ? group.primary().serverId : activeMasterServerId();
+    const auto config = std::find_if(servers_.cbegin(), servers_.cend(),
+                                     [&](const auto& server) { return server.id == source; });
+    if (config != servers_.cend()) {
+        if (group.primary().serverId != source) {
+            subscriptionLink_->setPlaceholderText("Сначала загрузите запись клиента с мастер-ноды");
+            return;
+        }
+        const QUrl base = config->subscriptionUrl.isEmpty() ? subscriptionAddresses_.value(source)
+                                                            : config->subscriptionUrl;
+        subscriptionLink_->setText(subscriptionLink(base, group.primary().subId));
+        subscriptionLink_->setPlaceholderText(
+            group.primary().subId.isEmpty()               ? "У клиента нет subId"
+            : subscriptionAddressErrors_.contains(source) ? subscriptionAddressErrors_.value(source)
+                                                          : "Получение адреса из панели…");
+        if (base.isEmpty() && !group.primary().subId.isEmpty())
+            discoverSubscriptionAddress(source);
+    }
 }
 
 void MainWindow::refreshEventsTable() {
@@ -1789,6 +1885,9 @@ void MainWindow::editServer() {
     delete apis_.take(id);
     apis_[id] = new ThreeXUiApi(config, this);
     inventories_.remove(id);
+    subscriptionAddresses_.remove(id);
+    subscriptionAddressErrors_.remove(id);
+    subscriptionAddressPending_.remove(id);
     recordEvent(id, "Подключение изменено", true, "Настройки обновлены");
     refreshUi();
     poll();
@@ -1818,6 +1917,9 @@ void MainWindow::removeServer() {
     delete apis_.take(id);
     inventories_.remove(id);
     inventoryErrors_.remove(id);
+    subscriptionAddresses_.remove(id);
+    subscriptionAddressErrors_.remove(id);
+    subscriptionAddressPending_.remove(id);
     latest_.remove(id);
     if (masterServerId_ == id) {
         masterServerId_.clear();
@@ -1828,6 +1930,77 @@ void MainWindow::removeServer() {
     reloadData();
     refreshUi();
 }
+void MainWindow::viewClientInbounds() {
+    const int row = clientTable_->currentRow();
+    if (row < 0 || row >= visibleSubscriptions_.size()) {
+        report("Сначала выберите подписку.");
+        return;
+    }
+    const auto group = visibleSubscriptions_[row];
+    const QString id = clientActionServer_->currentData().toString();
+    const auto config =
+        std::find_if(servers_.cbegin(), servers_.cend(), [&](const auto& s) { return s.id == id; });
+    const auto original = std::find_if(group.members.cbegin(), group.members.cend(),
+                                       [&](const auto& c) { return c.serverId == id; });
+    if (config == servers_.cend() || original == group.members.cend())
+        return;
+    const auto display = [this, server = *config, selected = *original](Inventory inventory,
+                                                                        bool canAttach) {
+        const auto found = std::find_if(
+            inventory.clients.cbegin(), inventory.clients.cend(), [&](const auto& client) {
+                return client.email == selected.email && client.id == selected.id &&
+                       client.subId == selected.subId;
+            });
+        if (found == inventory.clients.cend()) {
+            report("Клиент изменился в панели. Обновите список подписок.", true);
+            return;
+        }
+        Client client = *found;
+        if (!canAttach)
+            for (const auto& member : inventory.clients)
+                if (member.email == client.email && member.subId == client.subId &&
+                    (!client.subId.isEmpty() || member.id == client.id))
+                    for (const int bound : member.inboundIds)
+                        if (!client.inboundIds.contains(bound))
+                            client.inboundIds.append(bound);
+        ClientInboundsDialog dialog(server, inventory, client, canAttach, this);
+        if (dialog.exec() != QDialog::Accepted || !canAttach)
+            return;
+        auto* api = apis_.value(server.id);
+        if (!api || !writable(true))
+            return;
+        mutating_ = true;
+        setBusyUi();
+        report("Подключение новых инбаундов…");
+        api->attachClientInbounds(
+            client, dialog.addedInboundIds(), [this, id = server.id](auto result) {
+                completeMutation(id, "Подключение инбаундов", std::move(result));
+            });
+    };
+    if (demo_) {
+        display(inventories_.value(id), false);
+        return;
+    }
+    if (!writable(true) || !apis_.contains(id))
+        return;
+    auto* api = apis_[id];
+    mutating_ = true;
+    setBusyUi();
+    report("Загрузка текущих инбаундов клиента…");
+    api->fetchInventory([this, id, display](Outcome<Inventory> result) {
+        mutating_ = false;
+        setBusyUi();
+        if (!result.ok) {
+            report(result.error, true);
+            return;
+        }
+        inventories_[id] = result.value;
+        refreshClientsTable();
+        display(result.value,
+                apis_.contains(id) && apis_[id]->detectedFlavor() == ApiFlavor::ModernV3);
+    });
+}
+
 void MainWindow::editClient(bool create) {
     if (!writable(true))
         return;

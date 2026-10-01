@@ -924,6 +924,180 @@ void ThreeXUiApi::fetchStatus(Callback<Snapshot> callback) {
     });
 }
 
+Outcome<QUrl> ThreeXUiApi::parseSubscriptionSettings(const QJsonObject& object) {
+    if (!object.value(QStringLiteral("subEnable")).isBool())
+        return Outcome<QUrl>::failure(QStringLiteral("Панель не вернула настройки подписок."));
+    if (!object.value(QStringLiteral("subEnable")).toBool())
+        return Outcome<QUrl>::failure(QStringLiteral("Выдача подписок выключена в 3x-ui."));
+    const QString text = object.value(QStringLiteral("subURI")).toString().trimmed();
+    const QUrl url(text, QUrl::StrictMode);
+    if (text.isEmpty() || !url.isValid() || url.isRelative() || url.host().isEmpty() ||
+        (url.scheme() != QStringLiteral("https") && url.scheme() != QStringLiteral("http")) ||
+        !url.userInfo().isEmpty() || url.hasQuery() || url.hasFragment() || url.port() == 0)
+        return Outcome<QUrl>::failure(QStringLiteral(
+            "Панель не вернула корректный адрес выдачи подписок. Проверьте её настройки "
+            "подписок или задайте адрес в подключении приложения."));
+    return Outcome<QUrl>::success(url);
+}
+
+void ThreeXUiApi::fetchSubscriptionUrl(Callback<QUrl> callback) {
+    enqueue([this, callback = std::move(callback)]() mutable {
+        auto finish = [this, callback = std::move(callback)](Outcome<QUrl> result) mutable {
+            complete();
+            if (callback)
+                callback(std::move(result));
+        };
+        prepare([this, finish](Outcome<bool> prepared) mutable {
+            if (!prepared.ok) {
+                finish(Outcome<QUrl>::failure(prepared.error));
+                return;
+            }
+            auto parse = [finish](Outcome<QJsonValue> settings) mutable {
+                finish(settings.ok && settings.value.isObject()
+                           ? parseSubscriptionSettings(settings.value.toObject())
+                           : Outcome<QUrl>::failure(
+                                 settings.ok
+                                     ? QStringLiteral("Панель не вернула настройки подписок.")
+                                     : settings.error));
+            };
+            const QString legacy = QStringLiteral("/panel/setting/defaultSettings");
+            if (detected_ == ApiFlavor::LegacyV2) {
+                request("POST", legacy, {}, parse);
+                return;
+            }
+            request("POST", QStringLiteral("/panel/api/setting/defaultSettings"), {},
+                    [this, legacy, parse](Outcome<QJsonValue> settings) mutable {
+                        // Some older 3.x builds expose this read-only route at the UI prefix.
+                        // Never switch routes on an authorization failure or retry a mutation.
+                        if (!settings.ok && lastHttpStatus_ == 404)
+                            request("POST", legacy, {}, parse);
+                        else
+                            parse(std::move(settings));
+                    });
+        });
+    });
+}
+
+void ThreeXUiApi::attachClientInbounds(const Client& client, const QList<int>& additions,
+                                       Callback<bool> callback) {
+    enqueue([this, client, additions, callback = std::move(callback)]() mutable {
+        auto finish = [this, callback = std::move(callback)](Outcome<bool> result) mutable {
+            complete();
+            if (callback)
+                callback(std::move(result));
+        };
+        QSet<int> unique;
+        for (const int id : additions) {
+            if (id <= 0 || unique.contains(id) || client.inboundIds.contains(id)) {
+                finish(
+                    Outcome<bool>::failure(QStringLiteral("Некорректный список новых инбаундов.")));
+                return;
+            }
+            unique.insert(id);
+        }
+        if (additions.isEmpty()) {
+            finish(Outcome<bool>::failure(QStringLiteral("Выберите новые инбаунды.")));
+            return;
+        }
+        prepare([this, client, additions, finish](Outcome<bool> prepared) mutable {
+            if (!prepared.ok) {
+                finish(Outcome<bool>::failure(prepared.error));
+                return;
+            }
+            if (detected_ != ApiFlavor::ModernV3) {
+                finish(Outcome<bool>::failure(
+                    QStringLiteral("Добавление привязок требует 3x-ui 3.x.")));
+                return;
+            }
+            readClient(client, [this, client, additions,
+                                finish](Outcome<QJsonObject> fresh) mutable {
+                if (!fresh.ok) {
+                    finish(Outcome<bool>::failure(fresh.error));
+                    return;
+                }
+                request(
+                    "GET", QStringLiteral("/panel/api/inbounds/list"), {},
+                    [this, client, additions, original = fresh.value,
+                     finish](Outcome<QJsonValue> inbounds) mutable {
+                        if (!inbounds.ok || !inbounds.value.isArray()) {
+                            finish(Outcome<bool>::failure(inbounds.ok ? identityError()
+                                                                      : inbounds.error));
+                            return;
+                        }
+                        ClientDraft plan;
+                        plan.inboundIds = additions;
+                        const auto targets =
+                            selectedInbounds(inbounds.value.toArray(), plan, config_.id);
+                        if (!targets.ok) {
+                            finish(Outcome<bool>::failure(targets.error));
+                            return;
+                        }
+                        QJsonArray ids;
+                        for (const int id : additions)
+                            ids.append(id);
+                        request(
+                            "POST",
+                            QStringLiteral("/panel/api/clients/") + encodedSegment(client.email) +
+                                QStringLiteral("/attach"),
+                            {{QStringLiteral("inboundIds"), ids}},
+                            [this, client, additions, original,
+                             finish](Outcome<QJsonValue> attached) mutable {
+                                const QString partial =
+                                    QStringLiteral("Привязки могли измениться. Обновите клиентов "
+                                                   "перед повторением. ");
+                                if (!attached.ok) {
+                                    finish(Outcome<bool>::failure(partial + attached.error));
+                                    return;
+                                }
+                                request(
+                                    "GET",
+                                    QStringLiteral("/panel/api/clients/get/") +
+                                        encodedSegment(client.email),
+                                    {},
+                                    [client, additions, original, finish,
+                                     partial](Outcome<QJsonValue> checked) mutable {
+                                        if (!checked.ok) {
+                                            finish(Outcome<bool>::failure(partial + checked.error));
+                                            return;
+                                        }
+                                        const auto response = checked.value.toObject();
+                                        const auto raw =
+                                            response.value(QStringLiteral("client")).toObject();
+                                        const auto actual = inboundIds(
+                                            response.value(QStringLiteral("inboundIds")));
+                                        QList<int> expected = client.inboundIds;
+                                        expected.append(additions);
+                                        bool same = raw.value(QStringLiteral("email")).toString() ==
+                                                        client.email &&
+                                                    raw.value(QStringLiteral("id")) ==
+                                                        original.value(QStringLiteral("id"));
+                                        // 3x-ui may fill missing credentials for a newly added
+                                        // protocol. Every pre-existing nonempty credential must
+                                        // remain unchanged.
+                                        for (const auto* field :
+                                             {"uuid", "password", "auth", "subId"}) {
+                                            const auto key = QString::fromLatin1(field);
+                                            if (!original.value(key).toString().isEmpty())
+                                                same &= raw.value(key) == original.value(key);
+                                        }
+                                        if (!same || !actual.ok ||
+                                            !sameInboundIds(actual.value, expected)) {
+                                            finish(Outcome<bool>::failure(
+                                                partial +
+                                                QStringLiteral("Проверка идентификаторов или "
+                                                               "привязок не пройдена.")));
+                                            return;
+                                        }
+                                        finish(Outcome<bool>::success(true));
+                                    });
+                            },
+                            false, true);
+                    });
+            });
+        });
+    });
+}
+
 void ThreeXUiApi::readClient(const Client& client, Callback<QJsonObject> callback) {
     if (client.serverId != config_.id || !validEmail(client.email) || client.id.isEmpty()) {
         callback(Outcome<QJsonObject>::failure(identityError()));

@@ -190,10 +190,11 @@ ServerDialog::ServerDialog(const std::optional<ServerConfig>& existing, QWidget*
 
     auto* subscription = new QLineEdit(this);
     subscription->setObjectName(QStringLiteral("subscriptionUrl"));
-    subscription->setPlaceholderText(tr("Базовый адрес подписок, необязательно"));
+    subscription->setPlaceholderText(tr("Автоматически из панели; можно переопределить"));
     subscription->setText(result_.subscriptionUrl.toString(QUrl::FullyEncoded));
     form->addRow(tr("Адрес подпи&сок:"), subscription);
-    form->addRow(helperLabel(tr("Для подписок нужен базовый HTTP(S)-адрес без логина, "
+    form->addRow(helperLabel(tr("Оставьте пустым для получения адреса из 3x-ui. "
+                                "Для переопределения нужен базовый HTTP(S)-адрес без логина, "
                                 "параметров запроса и фрагмента."),
                              this));
 

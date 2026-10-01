@@ -1,0 +1,10 @@
+********* Start testing of InboundsTests *********
+Config: Using QtTest library 6.8.3, Qt 6.8.3 (x86_64-little_endian-llp64 shared (dynamic) release build; by MSVC 2022), windows 11
+PASS   : InboundsTests::initTestCase()
+PASS   : InboundsTests::existingAndMissingBindingsAreVisibleAndLocked()
+PASS   : InboundsTests::selectAndClearPreserveExistingBindings()
+PASS   : InboundsTests::onlyEligibleAdditionsCanBeAccepted()
+PASS   : InboundsTests::legacyAndDemoViewCannotAttach()
+PASS   : InboundsTests::cleanupTestCase()
+Totals: 6 passed, 0 failed, 0 skipped, 0 blacklisted, 34ms
+********* Finished testing of InboundsTests *********

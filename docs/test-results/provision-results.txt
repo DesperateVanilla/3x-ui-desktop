@@ -27,5 +27,5 @@ PASS   : ProvisionTests::apiDestructionDuringWriteReportsUnknownAndContinues()
 PASS   : ProvisionTests::destroyingCoordinatorSuppressesLateCallbacks()
 PASS   : ProvisionTests::exactExistingIdentityDoesNotAddAgain()
 PASS   : ProvisionTests::cleanupTestCase()
-Totals: 27 passed, 0 failed, 0 skipped, 0 blacklisted, 3443ms
+Totals: 27 passed, 0 failed, 0 skipped, 0 blacklisted, 3444ms
 ********* Finished testing of ProvisionTests *********

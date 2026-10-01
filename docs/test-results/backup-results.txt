@@ -9,5 +9,5 @@ PASS   : BackupTests::sizeLimitAndCappedRead()
 PASS   : BackupTests::atomicSaveAndReadRejectBadReplacement()
 PASS   : BackupTests::inspectionReleasesNamedConnectionsOnSuccessAndFailure()
 PASS   : BackupTests::cleanupTestCase()
-Totals: 9 passed, 0 failed, 0 skipped, 0 blacklisted, 331ms
+Totals: 9 passed, 0 failed, 0 skipped, 0 blacklisted, 348ms
 ********* Finished testing of BackupTests *********

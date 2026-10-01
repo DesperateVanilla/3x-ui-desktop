@@ -1,3 +1,4 @@
+#include "client_inbounds_dialog.h"
 #include "editor_dialogs.h"
 #include "main_window.h"
 #include <QApplication>
@@ -15,7 +16,7 @@ int main(int argc, char** argv) {
     QApplication app(argc, argv);
     app.setApplicationName("3X Control");
     app.setOrganizationName("3XControl");
-    app.setApplicationVersion("0.3.0");
+    app.setApplicationVersion("0.4.0");
     app.setStyle("Fusion");
     app.setFont(QFont("Segoe UI", 10));
     QPalette palette;
@@ -64,9 +65,9 @@ int main(int argc, char** argv) {
     parser.addOption(
         {"statistics-tab", "Вкладка статистики: 0 сеть, 1 CPU/RAM и отклик.", "number", "0"});
     parser.addOption({"size", "Размер окна для проверки интерфейса, например 1020x720.", "pixels"});
-    parser.addOption({"capture-dialog",
-                      "При --capture показать форму server или client на примерах данных.",
-                      "kind"});
+    parser.addOption(
+        {"capture-dialog",
+         "При --capture показать форму server, client или inbounds на примерах данных.", "kind"});
     parser.process(app);
     QString dataDir = parser.value("data-dir");
     if (dataDir.isEmpty())
@@ -91,7 +92,24 @@ int main(int argc, char** argv) {
     if (parser.isSet("capture") && parser.isSet("capture-dialog")) {
         if (parser.value("capture-dialog") == "server")
             captureDialog = std::make_unique<fleet::ServerDialog>(std::nullopt, &window);
-        else if (parser.value("capture-dialog") == "client") {
+        else if (parser.value("capture-dialog") == "inbounds") {
+            fleet::ServerConfig server;
+            server.id = "preview-master";
+            server.name = "Москва · мастер-нода";
+            fleet::Inventory inventory;
+            inventory.inbounds = {
+                {server.id, 1, "VLESS Reality", "vless", 443, true},
+                {server.id, 2, "VLESS WebSocket", "vless", 8443, true},
+                {server.id, 3, "Hysteria 2", "hysteria", 11891, true},
+                {server.id, 4, "Trojan TLS", "trojan", 9443, true},
+                {server.id, 5, "Пример выключенного inbound", "vless", 54300, false}};
+            fleet::Client client;
+            client.serverId = server.id;
+            client.email = "synthetic-client";
+            client.inboundIds = {1, 2};
+            captureDialog = std::make_unique<fleet::ClientInboundsDialog>(server, inventory, client,
+                                                                          true, &window);
+        } else if (parser.value("capture-dialog") == "client") {
             QList<fleet::ServerConfig> servers;
             QHash<QString, fleet::Inventory> inventories;
             const QStringList names = {"Москва · мастер-нода", "Нидерланды", "Германия"};

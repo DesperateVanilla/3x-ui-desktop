@@ -286,6 +286,193 @@ QByteArray sqliteFixture() {
 class CoreTests : public QObject {
     Q_OBJECT
   private slots:
+    void subscriptionSettingsRespectPanelAddress_data() {
+        QTest::addColumn<QString>("address");
+        QTest::addColumn<bool>("valid");
+        QTest::newRow("proxy") << "https://subscriptions.example.invalid/custom/base/" << true;
+        QTest::newRow("separate-port") << "http://node.example.invalid:2096/secret-sub/" << true;
+        QTest::newRow("ipv6") << "https://[2001:db8::1]:8443/sub/" << true;
+        QTest::newRow("encoded-path") << "https://sub.example.invalid/a%20b/" << true;
+        QTest::newRow("empty") << "" << false;
+        QTest::newRow("relative") << "/sub/" << false;
+        QTest::newRow("ftp") << "ftp://sub.example.invalid/sub/" << false;
+        QTest::newRow("credentials") << "https://user:secret@sub.example.invalid/sub/" << false;
+        QTest::newRow("query") << "https://sub.example.invalid/sub/?token=secret" << false;
+        QTest::newRow("fragment") << "https://sub.example.invalid/sub/#secret" << false;
+        QTest::newRow("port-zero") << "https://sub.example.invalid:0/sub/" << false;
+    }
+    void subscriptionSettingsRespectPanelAddress() {
+        QFETCH(QString, address);
+        QFETCH(bool, valid);
+        const auto result =
+            ThreeXUiApi::parseSubscriptionSettings({{"subEnable", true}, {"subURI", address}});
+        QCOMPARE(result.ok, valid);
+        if (valid)
+            QCOMPARE(result.value.toString(QUrl::FullyEncoded), address);
+        else
+            QVERIFY(!result.error.contains("secret@"));
+    }
+    void disabledOrMissingSubscriptionSettingsAreNotGuessed() {
+        QVERIFY(!ThreeXUiApi::parseSubscriptionSettings({}).ok);
+        const auto disabled = ThreeXUiApi::parseSubscriptionSettings(
+            {{"subEnable", false}, {"subURI", "https://sub.example.invalid/sub/"}});
+        QVERIFY(!disabled.ok);
+        QVERIFY(disabled.error.contains("выключена"));
+    }
+    void subscriptionSettingsUseReadOnlyVersionRoutes_data() {
+        QTest::addColumn<int>("flavor");
+        QTest::addColumn<int>("firstStatus");
+        QTest::addColumn<int>("requests");
+        QTest::addColumn<bool>("success");
+        QTest::newRow("v3") << int(ApiFlavor::ModernV3) << 200 << 1 << true;
+        QTest::newRow("v2") << int(ApiFlavor::LegacyV2) << 200 << 1 << true;
+        QTest::newRow("old-v3-404") << int(ApiFlavor::ModernV3) << 404 << 2 << true;
+        QTest::newRow("no-fallback-on-403") << int(ApiFlavor::ModernV3) << 403 << 1 << false;
+    }
+    void subscriptionSettingsUseReadOnlyVersionRoutes() {
+        QFETCH(int, flavor);
+        QFETCH(int, firstStatus);
+        QFETCH(int, requests);
+        QFETCH(bool, success);
+        MockPanel mock;
+        const auto settings = envelope(QJsonObject{
+            {"subEnable", true}, {"subURI", "https://proxy.example.invalid/remote/sub/"}});
+        mock.add(firstStatus, settings);
+        if (requests == 2)
+            mock.add(200, settings);
+        ThreeXUiApi api(configuration(mock, ApiFlavor(flavor)));
+        bool done = false;
+        Outcome<QUrl> result;
+        api.fetchSubscriptionUrl([&](auto value) {
+            result = value;
+            done = true;
+        });
+        QTRY_VERIFY(done);
+        QCOMPARE(result.ok, success);
+        QCOMPARE(mock.requests.size(), requests);
+        const QByteArray prefix = flavor == int(ApiFlavor::LegacyV2)
+                                      ? "/secret/base/panel/setting/"
+                                      : "/secret/base/panel/api/setting/";
+        QCOMPARE(mock.requests.first().target, prefix + "defaultSettings");
+        for (const auto& request : mock.requests) {
+            QCOMPARE(request.method, QByteArray("POST"));
+            QVERIFY(!request.target.contains("update"));
+        }
+        if (requests == 2)
+            QCOMPARE(mock.requests.last().target,
+                     QByteArray("/secret/base/panel/setting/defaultSettings"));
+    }
+    void attachPreservesIdentityAndExistingMembership() {
+        MockPanel mock;
+        mock.add(200, envelope(freshResponse()));
+        mock.add(200, envelope(QJsonArray{inbound(1), inbound(2), inbound(3, "hysteria")}));
+        mock.add(200, envelope());
+        auto attached = modernRecord();
+        attached.insert("inboundIds", QJsonArray{1, 2, 3});
+        attached.insert("auth", "new-synthetic-auth-for-new-protocol");
+        mock.add(200, envelope(freshResponse(attached)));
+        ThreeXUiApi api(configuration(mock));
+        bool done = false;
+        Outcome<bool> result;
+        api.attachClientInbounds(selectedModern(), {3}, [&](auto value) {
+            result = value;
+            done = true;
+        });
+        QTRY_VERIFY(done);
+        QVERIFY2(result.ok, qPrintable(result.error));
+        QCOMPARE(mock.requests.size(), 4);
+        QCOMPARE(mock.requests.at(2).target,
+                 QByteArray("/secret/base/panel/api/clients/alice%2Btag%40example.com/attach"));
+        QCOMPARE(QJsonDocument::fromJson(mock.requests.at(2).body).object(),
+                 QJsonObject({{"inboundIds", QJsonArray{3}}}));
+    }
+    void attachStaleIdentityNeverWrites() {
+        MockPanel mock;
+        auto changed = modernRecord();
+        changed.insert("uuid", "another-client-credential");
+        mock.add(200, envelope(freshResponse(changed)));
+        ThreeXUiApi api(configuration(mock));
+        bool done = false;
+        api.attachClientInbounds(selectedModern(), {3}, [&](auto result) {
+            QVERIFY(!result.ok);
+            done = true;
+        });
+        QTRY_VERIFY(done);
+        QCOMPARE(mock.requests.size(), 1);
+        QCOMPARE(mock.requests.first().method, QByteArray("GET"));
+    }
+    void attachRejectsDisabledTargetsBeforeWriting() {
+        MockPanel mock;
+        mock.add(200, envelope(freshResponse()));
+        auto disabled = inbound(3);
+        disabled.insert("enable", false);
+        mock.add(200, envelope(QJsonArray{inbound(1), inbound(2), disabled}));
+        ThreeXUiApi api(configuration(mock));
+        bool done = false;
+        api.attachClientInbounds(selectedModern(), {3}, [&](auto result) {
+            QVERIFY(!result.ok);
+            done = true;
+        });
+        QTRY_VERIFY(done);
+        QCOMPARE(mock.requests.size(), 2);
+    }
+    void partialAttachIsNotRetried() {
+        MockPanel mock;
+        mock.add(200, envelope(freshResponse()));
+        mock.add(200, envelope(QJsonArray{inbound(1), inbound(2), inbound(3)}));
+        mock.add(200, {{"success", false}, {"msg", "secret-client-password"}});
+        ThreeXUiApi api(configuration(mock));
+        bool done = false;
+        Outcome<bool> result;
+        api.attachClientInbounds(selectedModern(), {3}, [&](auto value) {
+            result = value;
+            done = true;
+        });
+        QTRY_VERIFY(done);
+        QVERIFY(!result.ok);
+        QVERIFY(result.error.contains("могли измениться"));
+        QVERIFY(!result.error.contains("secret-client-password"));
+        QCOMPARE(mock.requests.size(), 3);
+    }
+    void attachReadbackMustKeepOldInbounds() {
+        MockPanel mock;
+        mock.add(200, envelope(freshResponse()));
+        mock.add(200, envelope(QJsonArray{inbound(1), inbound(2), inbound(3)}));
+        mock.add(200, envelope());
+        auto broken = modernRecord();
+        broken.insert("inboundIds", QJsonArray{3});
+        mock.add(200, envelope(freshResponse(broken)));
+        ThreeXUiApi api(configuration(mock));
+        bool done = false;
+        api.attachClientInbounds(selectedModern(), {3}, [&](auto result) {
+            QVERIFY(!result.ok);
+            done = true;
+        });
+        QTRY_VERIFY(done);
+        QCOMPARE(mock.requests.size(), 4);
+    }
+    void attachInvalidOrLegacyPlansNeverWrite() {
+        for (const auto& ids : {QList<int>{}, QList<int>{0}, QList<int>{3, 3}, QList<int>{1}}) {
+            MockPanel mock;
+            ThreeXUiApi api(configuration(mock));
+            bool done = false;
+            api.attachClientInbounds(selectedModern(), ids, [&](auto result) {
+                QVERIFY(!result.ok);
+                done = true;
+            });
+            QTRY_VERIFY(done);
+            QVERIFY(mock.requests.isEmpty());
+        }
+        MockPanel mock;
+        ThreeXUiApi api(configuration(mock, ApiFlavor::LegacyV2));
+        bool done = false;
+        api.attachClientInbounds(selectedModern(), {3}, [&](auto result) {
+            QVERIFY(!result.ok);
+            done = true;
+        });
+        QTRY_VERIFY(done);
+        QVERIFY(mock.requests.isEmpty());
+    }
     void statusMissingAndZeroFields() {
         const auto missing = ThreeXUiApi::parseStatus({}, QStringLiteral("s"));
         QVERIFY(missing.ok);

@@ -14,6 +14,9 @@ class ThreeXUiApi : public QObject {
     ApiFlavor detectedFlavor() const { return detected_; }
     void fetchStatus(Callback<Snapshot> callback);
     void fetchInventory(Callback<Inventory> callback);
+    void fetchSubscriptionUrl(Callback<QUrl> callback);
+    void attachClientInbounds(const Client& client, const QList<int>& additions,
+                              Callback<bool> callback);
     void createClient(const ClientDraft& draft, Callback<bool> callback);
     void updateClient(const Client& client, const ClientPatch& patch, Callback<bool> callback);
     void deleteClient(const Client& client, Callback<bool> callback);
@@ -23,6 +26,7 @@ class ThreeXUiApi : public QObject {
     void restoreDatabase(const QByteArray& data, bool keepHostSettings, Callback<bool> callback);
     static Outcome<QUrl> validatePanelUrl(const ServerConfig& config);
     static Outcome<Snapshot> parseStatus(const QJsonObject& object, const QString& serverId);
+    static Outcome<QUrl> parseSubscriptionSettings(const QJsonObject& object);
     static Outcome<Inventory> parseInventory(const QJsonArray& inbounds,
                                              const QJsonArray& modernClients,
                                              const QString& serverId, bool modern);
